@@ -51,20 +51,24 @@ const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
-export function assetResponseHeaders(filePath: string): Record<string, string> {
+export function assetResponseHeaders(
+  filePath: string,
+  source: "attachment" | "workspace",
+): Record<string, string> {
   const lowerPath = filePath.toLowerCase();
   const extension = /\.[a-z0-9]+$/i.exec(lowerPath)?.[0] ?? "";
   const isSafeImageExtension = SAFE_IMAGE_FILE_EXTENSIONS.has(extension);
+  const forceAttachmentDownload = source === "attachment" && !isSafeImageExtension;
   return {
     "Cache-Control": "private, max-age=3600",
     "X-Content-Type-Options": "nosniff",
     ...(lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
       ? { "Content-Type": "text/html; charset=utf-8" }
       : {}),
-    ...(extension === ".svg" || !isSafeImageExtension
+    ...(extension === ".svg" || forceAttachmentDownload
       ? { "Content-Security-Policy": SVG_CONTENT_SECURITY_POLICY }
       : {}),
-    ...(!isSafeImageExtension ? { "Content-Disposition": "attachment" } : {}),
+    ...(forceAttachmentDownload ? { "Content-Disposition": "attachment" } : {}),
   };
 }
 
@@ -232,7 +236,7 @@ export const assetRouteLayer = HttpRouter.add(
     }
     return yield* HttpServerResponse.file(asset.path, {
       status: 200,
-      headers: assetResponseHeaders(asset.path),
+      headers: assetResponseHeaders(asset.path, asset.source),
     }).pipe(
       Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
     );

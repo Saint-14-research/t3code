@@ -29,17 +29,17 @@ describe("http dev routing", () => {
 
 describe("assetResponseHeaders", () => {
   it("sandboxes SVG assets", () => {
-    expect(assetResponseHeaders("/attachments/user-image.svg")).toMatchObject({
+    expect(assetResponseHeaders("/attachments/user-image.svg", "attachment")).toMatchObject({
       "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
       "X-Content-Type-Options": "nosniff",
     });
-    expect(assetResponseHeaders("/attachments/user-image.SVG")).toHaveProperty(
+    expect(assetResponseHeaders("/attachments/user-image.SVG", "attachment")).toHaveProperty(
       "Content-Security-Policy",
     );
   });
 
   it("does not apply document policy to raster images", () => {
-    expect(assetResponseHeaders("/attachments/user-image.png")).toEqual({
+    expect(assetResponseHeaders("/attachments/user-image.png", "attachment")).toEqual({
       "Cache-Control": "private, max-age=3600",
       "X-Content-Type-Options": "nosniff",
     });
@@ -57,14 +57,27 @@ describe("assetResponseHeaders", () => {
   });
 
   it("forces non-image assets to download under a sandboxed policy", () => {
-    expect(assetResponseHeaders("/attachments/user-file.html")).toMatchObject({
+    expect(assetResponseHeaders("/attachments/user-file.html", "attachment")).toMatchObject({
       "Content-Disposition": "attachment",
       "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
       "X-Content-Type-Options": "nosniff",
     });
-    expect(assetResponseHeaders("/attachments/user-file.pdf")).toHaveProperty(
+    expect(assetResponseHeaders("/attachments/user-file.pdf", "attachment")).toHaveProperty(
       "Content-Disposition",
       "attachment",
+    );
+  });
+
+  it("keeps workspace browser-preview assets renderable", () => {
+    expect(assetResponseHeaders("/workspace/report.html", "workspace")).toEqual({
+      "Cache-Control": "private, max-age=3600",
+      "X-Content-Type-Options": "nosniff",
+    });
+    expect(assetResponseHeaders("/workspace/report.pdf", "workspace")).not.toHaveProperty(
+      "Content-Disposition",
+    );
+    expect(assetResponseHeaders("/workspace/report.css", "workspace")).not.toHaveProperty(
+      "Content-Security-Policy",
     );
   });
 });
