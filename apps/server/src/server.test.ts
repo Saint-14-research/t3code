@@ -4547,6 +4547,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         withWsRpcClient(wsUrl, (client) =>
           Effect.gen(function* () {
             const issued = yield* client[WS_METHODS.attachmentsCreateUploadUrl]({
+              type: "image",
               name: "screenshot.png",
               mimeType: "image/png",
               sizeBytes: 6,
@@ -4570,6 +4571,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             assert.isFalse(yield* fileSystem.exists(attachmentPath));
 
             const streamed = yield* client[WS_METHODS.attachmentsCreateUploadUrl]({
+              type: "image",
               name: "streamed.png",
               mimeType: "image/png",
               sizeBytes: 6,
@@ -6226,6 +6228,85 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           messageCreatedAt: now,
         },
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("persists generic attachments on the environment receiving the websocket turn", () =>
+    Effect.gen(function* () {
+      const dispatchedCommands: OrchestrationCommand[] = [];
+      const config = yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-remote-file"),
+            threadId: ThreadId.make("thread-remote-file"),
+            message: {
+              messageId: MessageId.make("msg-remote-file"),
+              role: "user",
+              text: "Inspect this remote file",
+              attachments: [
+                {
+                  type: "file",
+                  name: "air-to-mini.pdf",
+                  mimeType: "application/pdf",
+                  sizeBytes: 4,
+                  dataUrl: "data:application/pdf;base64,JVBERg==",
+                },
+              ],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+        ),
+      );
+
+      const normalized = dispatchedCommands[0];
+      assertTrue(normalized?.type === "thread.turn.start");
+      if (normalized?.type !== "thread.turn.start") {
+        return;
+      }
+      const attachment = normalized.message.attachments[0];
+      assert.deepEqual(
+        attachment && {
+          type: attachment.type,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.sizeBytes,
+        },
+        {
+          type: "file",
+          name: "air-to-mini.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 4,
+        },
+      );
+      assert.isDefined(attachment);
+      if (!attachment) {
+        return;
+      }
+
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const persistedBytes = yield* fileSystem.readFile(
+        path.join(config.attachmentsDir, `${attachment.id}.pdf`),
+      );
+      assert.equal(Buffer.from(persistedBytes).toString(), "%PDF");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -8131,6 +8212,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         withWsRpcClient(wsUrl, (client) =>
           Effect.gen(function* () {
             const upload = yield* client[WS_METHODS.attachmentsCreateUploadUrl]({
+              type: "image",
               name: "screenshot.png",
               mimeType: "image/png",
               sizeBytes: 6,

@@ -399,8 +399,8 @@ import {
 } from "../versionSkew";
 import { useAssetUrls } from "../assets/assetUrls";
 
-const IMAGE_ONLY_BOOTSTRAP_PROMPT =
-  "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
+  "[User attached one or more files without additional text. Respond using the conversation context and the attached file(s).]";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -5628,7 +5628,7 @@ function ChatViewContent(props: ChatViewProps) {
       model: ctxSelectedModel,
       models: ctxSelectedProviderModels,
       effort: ctxSelectedPromptEffort,
-      text: messageTextForSend || IMAGE_ONLY_BOOTSTRAP_PROMPT,
+      text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
       return;
@@ -5642,7 +5642,7 @@ function ChatViewContent(props: ChatViewProps) {
       await awaitAttachmentUploads(composerImagesSnapshot.map((image) => image.id));
       if (getUploadedAttachments({ environmentId, images: composerImagesSnapshot }) === null) {
         sendInFlightRef.current = false;
-        setThreadError(threadIdForSend, "Retry or remove failed image uploads before sending.");
+        setThreadError(threadIdForSend, "Retry or remove failed attachment uploads before sending.");
         return;
       }
     }
@@ -5683,12 +5683,12 @@ function ChatViewContent(props: ChatViewProps) {
         if (supportsAttachmentUploads) {
           const uploaded = getUploadedAttachments({ environmentId, images: [image] })?.[0];
           if (!uploaded) {
-            throw new Error(`Image '${image.name}' did not finish uploading.`);
+            throw new Error(`Attachment '${image.name}' did not finish uploading.`);
           }
           return uploaded;
         }
         return {
-          type: "image" as const,
+          type: image.type,
           name: image.name,
           mimeType: image.mimeType,
           sizeBytes: image.sizeBytes,
@@ -5697,7 +5697,7 @@ function ChatViewContent(props: ChatViewProps) {
       }),
     );
     const optimisticAttachments = composerImagesSnapshot.map((image) => ({
-      type: "image" as const,
+      type: image.type,
       id: image.id,
       name: image.name,
       mimeType: image.mimeType,
@@ -5764,7 +5764,7 @@ function ChatViewContent(props: ChatViewProps) {
     let titleSeed = trimmed;
     if (!titleSeed) {
       if (firstComposerImageName) {
-        titleSeed = `Image: ${firstComposerImageName}`;
+        titleSeed = `Attachment: ${firstComposerImageName}`;
       } else if (composerTerminalContextsSnapshot.length > 0) {
         titleSeed = formatTerminalContextLabel(composerTerminalContextsSnapshot[0]!);
       } else if (composerElementContextsSnapshot.length > 0) {

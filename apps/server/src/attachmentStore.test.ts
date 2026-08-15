@@ -77,6 +77,26 @@ describe("attachmentStore", () => {
     }
   });
 
+  it("resolves arbitrary file attachment extensions by id", () => {
+    const attachmentsDir = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3code-attachment-store-"),
+    );
+    try {
+      const attachmentId = "thread-1-file-attachment";
+      const pdfPath = NodePath.join(attachmentsDir, `${attachmentId}.pdf`);
+      NodeFS.writeFileSync(pdfPath, Buffer.from("%PDF"));
+
+      expect(
+        resolveAttachmentPathById({
+          attachmentsDir,
+          attachmentId,
+        }),
+      ).toBe(pdfPath);
+    } finally {
+      NodeFS.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+
   it("returns null when no attachment file exists for the id", () => {
     const attachmentsDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-attachment-store-"),

@@ -51,6 +51,7 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
+  FileIcon,
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
@@ -1035,8 +1036,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                     />
                   </button>
                 ) : (
-                  <div className="flex min-h-[72px] items-center justify-center px-2 py-3 text-center text-secondary-label text-[11px]">
-                    {image.name}
+                  <div
+                    title={image.name}
+                    className="flex min-h-[72px] items-center justify-center gap-2 px-2 py-3 text-center text-secondary-label text-[11px]"
+                  >
+                    <FileIcon className="size-4 shrink-0" aria-hidden="true" />
+                    <span className="line-clamp-2 break-all">{image.name}</span>
                   </div>
                 )}
               </div>

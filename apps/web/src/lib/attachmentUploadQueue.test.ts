@@ -110,6 +110,19 @@ function makeImage(id: string): ComposerImageAttachment {
   };
 }
 
+function makeFile(id: string): ComposerImageAttachment {
+  const file = new File(["notes"], `${id}.txt`, { type: "text/plain" });
+  return {
+    type: "file",
+    id,
+    name: file.name,
+    mimeType: file.type,
+    sizeBytes: file.size,
+    previewUrl: "",
+    file,
+  };
+}
+
 describe("attachmentUploadQueue", () => {
   beforeEach(() => {
     TestXmlHttpRequest.requests = [];
@@ -184,6 +197,40 @@ describe("attachmentUploadQueue", () => {
       {
         environmentId: firstEnvironment,
         input: { attachmentId: "pending-environment-1-image-1.png" },
+      },
+      expect.anything(),
+    );
+  });
+
+  it("uploads generic files and preserves their attachment type", async () => {
+    const file = makeFile("file-1");
+    startAttachmentUpload({ environmentId: firstEnvironment, image: file });
+    await Promise.resolve();
+
+    const settled = awaitAttachmentUploads([file.id]);
+    TestXmlHttpRequest.requests[0]!.complete();
+    await settled;
+
+    expect(getUploadedAttachments({ environmentId: firstEnvironment, images: [file] })).toEqual([
+      {
+        type: "file",
+        id: "pending-environment-1-file-1.txt",
+        name: "file-1.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+      },
+    ]);
+    expect(mocks.runAtomCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      mocks.createUploadUrl,
+      {
+        environmentId: firstEnvironment,
+        input: {
+          type: "file",
+          name: "file-1.txt",
+          mimeType: "text/plain",
+          sizeBytes: 5,
+        },
       },
       expect.anything(),
     );

@@ -25,6 +25,7 @@ const testLayer = ServerSecretStore.layer.pipe(
 );
 
 const uploadInput = {
+  type: "image",
   name: "screenshot.png",
   mimeType: "image/png",
   sizeBytes: 6,
@@ -39,6 +40,7 @@ describe("AttachmentUpload", () => {
       const token = issued.relativeUrl.slice(`${ATTACHMENT_UPLOAD_ROUTE_PREFIX}/`.length);
       expect(yield* validateAttachmentUploadToken(token)).toMatchObject({
         kind: "attachment-upload",
+        type: "image",
         attachmentId: issued.attachmentId,
         name: "screenshot.png",
         mimeType: "image/png",
@@ -105,6 +107,28 @@ describe("AttachmentUpload", () => {
       expect(
         NodeFS.readdirSync(config.attachmentsDir).filter((entry) => entry.endsWith(".part")),
       ).toEqual([]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("stores generic files with a safe inferred extension", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const issued = yield* issueAttachmentUploadUrl({
+        type: "file",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 4,
+      });
+      const token = issued.relativeUrl.slice(`${ATTACHMENT_UPLOAD_ROUTE_PREFIX}/`.length);
+      const claims = yield* validateAttachmentUploadToken(token);
+      if (!claims) {
+        throw new Error("Expected valid upload claims.");
+      }
+
+      expect(yield* storeAttachmentUpload(claims, new Uint8Array(4))).toEqual({ ok: true });
+      expect(
+        NodeFS.existsSync(NodePath.join(config.attachmentsDir, `${issued.attachmentId}.txt`)),
+      ).toBe(true);
     }).pipe(Effect.provide(testLayer)),
   );
 

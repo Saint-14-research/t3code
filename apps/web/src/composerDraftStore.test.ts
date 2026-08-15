@@ -66,6 +66,7 @@ import {
   markPromotedDraftThreads,
   markPromotedDraftThreadsByRef,
   type ComposerImageAttachment,
+  hydrateImagesFromPersisted,
   useComposerDraftStore,
   DraftId,
 } from "./composerDraftStore";
@@ -103,6 +104,28 @@ function makeImage(input: {
     file,
   };
 }
+
+describe("hydrateImagesFromPersisted", () => {
+  it("restores non-image files as plain attachments without image previews", () => {
+    const attachments = hydrateImagesFromPersisted([
+      {
+        id: "file-1",
+        name: "report.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 4,
+        dataUrl: "data:application/pdf;base64,JVBERg==",
+      },
+    ]);
+
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({
+      type: "file",
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      previewUrl: "",
+    });
+  });
+});
 
 function makeTerminalContext(input: {
   id: string;

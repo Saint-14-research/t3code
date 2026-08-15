@@ -3,11 +3,12 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import {
+  CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS,
   type ClientOrchestrationCommand,
   type IsoDateTime,
   type OrchestrationCommand,
   OrchestrationDispatchCommandError,
-  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
 } from "@t3tools/contracts";
 
 import {
@@ -197,16 +198,22 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           }
 
           const parsed = parseBase64DataUrl(attachment.dataUrl);
-          if (!parsed || !parsed.mimeType.startsWith("image/")) {
+          if (!parsed) {
             return yield* new OrchestrationDispatchCommandError({
-              message: `Invalid image attachment payload for '${attachment.name}'.`,
+              message: `Invalid attachment payload for '${attachment.name}'.`,
+            });
+          }
+
+          if (parsed.mimeType.length > CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS) {
+            return yield* new OrchestrationDispatchCommandError({
+              message: `Attachment '${attachment.name}' has an invalid media type.`,
             });
           }
 
           const bytes = Buffer.from(parsed.base64, "base64");
-          if (bytes.byteLength === 0 || bytes.byteLength > PROVIDER_SEND_TURN_MAX_IMAGE_BYTES) {
+          if (bytes.byteLength === 0 || bytes.byteLength > PROVIDER_SEND_TURN_MAX_FILE_BYTES) {
             return yield* new OrchestrationDispatchCommandError({
-              message: `Image attachment '${attachment.name}' is empty or too large.`,
+              message: `Attachment '${attachment.name}' is empty or too large.`,
             });
           }
 
@@ -218,10 +225,10 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           }
 
           const persistedAttachment = {
-            type: "image" as const,
+            type: parsed.mimeType.startsWith("image/") ? ("image" as const) : ("file" as const),
             id: attachmentId,
             name: attachment.name,
-            mimeType: parsed.mimeType.toLowerCase(),
+            mimeType: parsed.mimeType,
             sizeBytes: bytes.byteLength,
           };
 

@@ -55,4 +55,16 @@ describe("assetResponseHeaders", () => {
       "text/html; charset=utf-8",
     );
   });
+
+  it("forces non-image assets to download under a sandboxed policy", () => {
+    expect(assetResponseHeaders("/attachments/user-file.html")).toMatchObject({
+      "Content-Disposition": "attachment",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+      "X-Content-Type-Options": "nosniff",
+    });
+    expect(assetResponseHeaders("/attachments/user-file.pdf")).toHaveProperty(
+      "Content-Disposition",
+      "attachment",
+    );
+  });
 });

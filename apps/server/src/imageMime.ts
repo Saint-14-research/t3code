@@ -135,3 +135,21 @@ export function inferImageExtension(input: { mimeType: string; fileName?: string
 
   return ".bin";
 }
+
+export function inferAttachmentExtension(input: { mimeType: string; fileName?: string }): string {
+  if (input.mimeType.toLowerCase().startsWith("image/")) {
+    return inferImageExtension(input);
+  }
+
+  const fileName = input.fileName?.trim() ?? "";
+  const extensionMatch = /\.([a-z0-9]{1,16})$/i.exec(fileName);
+  if (extensionMatch) {
+    return `.${extensionMatch[1]!.toLowerCase()}`;
+  }
+
+  const fromMime = Mime.getExtension(input.mimeType);
+  const normalizedFromMime = fromMime
+    ? `${fromMime.startsWith(".") ? "" : "."}${fromMime}`.toLowerCase()
+    : "";
+  return /^\.[a-z0-9]{1,16}$/i.test(normalizedFromMime) ? normalizedFromMime : ".bin";
+}

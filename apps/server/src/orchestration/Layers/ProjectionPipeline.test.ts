@@ -1030,10 +1030,10 @@ it.layer(
           text: "Remove",
           attachments: [
             {
-              type: "image",
+              type: "file",
               id: removeAttachmentId,
-              name: "remove.png",
-              mimeType: "image/png",
+              name: "remove.pdf",
+              mimeType: "application/pdf",
               sizeBytes: 5,
             },
           ],
@@ -1045,7 +1045,7 @@ it.layer(
       });
 
       const keepPath = path.join(attachmentsDir, `${keepAttachmentId}.png`);
-      const removePath = path.join(attachmentsDir, `${removeAttachmentId}.png`);
+      const removePath = path.join(attachmentsDir, `${removeAttachmentId}.pdf`);
       yield* fileSystem.makeDirectory(attachmentsDir, { recursive: true });
       yield* fileSystem.writeFileString(keepPath, "keep");
       yield* fileSystem.writeFileString(removePath, "remove");

@@ -1149,6 +1149,71 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("appends attachment file paths to the turn input text", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+
+      const session = yield* provider.startSession(asThreadId("thread-attach"), {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-attach"),
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      const attachment = {
+        type: "image" as const,
+        id: "thread-attach-12345678-1234-1234-1234-123456789abc",
+        name: "screenshot.png",
+        mimeType: "image/png",
+        sizeBytes: 123,
+      };
+
+      routing.codex.sendTurn.mockClear();
+      yield* provider.sendTurn({
+        threadId: session.threadId,
+        input: "use this screenshot",
+        attachments: [attachment],
+      });
+
+      const turnInput = routing.codex.sendTurn.mock.calls[0]?.[0] as ProviderSendTurnInput;
+      assert.equal(typeof turnInput.input, "string");
+      const turnText = turnInput.input ?? "";
+      assert.equal(turnText.startsWith("use this screenshot"), true);
+      assert.include(turnText, '[Attached image "screenshot.png" is saved at: ');
+      assert.equal(turnText.endsWith(`${attachment.id}.png]`), true);
+
+      // An attachment-only turn stays valid and the injected line becomes the
+      // whole input text, so the agent still learns the path.
+      routing.codex.sendTurn.mockClear();
+      yield* provider.sendTurn({
+        threadId: session.threadId,
+        attachments: [attachment],
+      });
+      const imageOnlyInput = routing.codex.sendTurn.mock.calls[0]?.[0] as ProviderSendTurnInput;
+      assert.equal(imageOnlyInput.input?.startsWith('[Attached image "screenshot.png"'), true);
+
+      const fileAttachment = {
+        type: "file" as const,
+        id: "thread-attach-12345678-1234-1234-1234-123456789abd",
+        name: "report.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 456,
+      };
+      routing.codex.sendTurn.mockClear();
+      yield* provider.sendTurn({
+        threadId: session.threadId,
+        input: "summarize this",
+        attachments: [fileAttachment],
+      });
+      const fileTurnInput = routing.codex.sendTurn.mock.calls[0]?.[0] as ProviderSendTurnInput;
+      assert.include(fileTurnInput.input ?? "", '[Attached file "report.pdf" is saved at: ');
+      assert.equal(fileTurnInput.input?.endsWith(`${fileAttachment.id}.pdf]`), true);
+
+      yield* provider.stopSession({ threadId: session.threadId });
+    }),
+  );
+
   it.effect("recovers stale persisted sessions for rollback by resuming thread identity", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

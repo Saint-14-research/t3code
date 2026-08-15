@@ -29,7 +29,7 @@ import {
 } from "../auth/utils.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
-import { inferImageExtension } from "../imageMime.ts";
+import { inferAttachmentExtension, inferImageExtension } from "../imageMime.ts";
 
 export const ATTACHMENT_UPLOAD_ROUTE_PREFIX = "/api/attachments/upload";
 
@@ -41,6 +41,7 @@ const lastPendingSweepByDirectory = new Map<string, number>();
 const AttachmentUploadClaims = Schema.Struct({
   version: Schema.Literal(1),
   kind: Schema.Literal("attachment-upload"),
+  type: Schema.Literals(["image", "file"]),
   attachmentId: Schema.String,
   name: Schema.String,
   mimeType: Schema.String,
@@ -95,6 +96,7 @@ export const issueAttachmentUploadUrl = Effect.fn("AttachmentUpload.issueUrl")(f
     encodeAttachmentUploadClaims({
       version: 1,
       kind: "attachment-upload",
+      type: input.type,
       attachmentId,
       name: input.name,
       mimeType: input.mimeType,
@@ -152,7 +154,10 @@ export const storeAttachmentUpload = Effect.fn("AttachmentUpload.store")(functio
   }
 
   const config = yield* ServerConfig.ServerConfig;
-  const extension = inferImageExtension({ mimeType: claims.mimeType, fileName: claims.name });
+  const extension =
+    claims.type === "image"
+      ? inferImageExtension({ mimeType: claims.mimeType, fileName: claims.name })
+      : inferAttachmentExtension({ mimeType: claims.mimeType, fileName: claims.name });
   const relativePath = `${claims.attachmentId}${extension}`;
   const finalPath = resolveAttachmentRelativePath({
     attachmentsDir: config.attachmentsDir,

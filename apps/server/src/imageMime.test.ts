@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { inferImageExtension, parseBase64DataUrl } from "./imageMime.ts";
+import { inferAttachmentExtension, inferImageExtension, parseBase64DataUrl } from "./imageMime.ts";
 
 describe("imageMime", () => {
   it("parses base64 data URL with mime type", () => {
@@ -91,5 +91,26 @@ describe("imageMime", () => {
 
   it("does not read inherited keys from mime extension map", () => {
     expect(inferImageExtension({ mimeType: "constructor" })).toBe(".bin");
+  });
+
+  it("derives safe extensions for generic attachments", () => {
+    expect(
+      inferAttachmentExtension({ mimeType: "application/pdf", fileName: "Quarterly.Report.PDF" }),
+    ).toBe(".pdf");
+    expect(
+      inferAttachmentExtension({
+        mimeType: "text/plain",
+        fileName: "extension-too-long.abcdefghijklmnopq",
+      }),
+    ).toBe(".txt");
+    expect(
+      inferAttachmentExtension({ mimeType: "application/x-unknown", fileName: "no-extension" }),
+    ).toBe(".bin");
+    expect(
+      inferAttachmentExtension({ mimeType: "application/pdf", fileName: "unsafe.file-name" }),
+    ).toBe(".pdf");
+    expect(inferAttachmentExtension({ mimeType: "image/jpeg", fileName: "misleading.pdf" })).toBe(
+      ".jpg",
+    );
   });
 });

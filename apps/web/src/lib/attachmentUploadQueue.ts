@@ -101,10 +101,11 @@ function uploadBytes(input: {
 }
 
 async function runUpload(job: UploadJob): Promise<void> {
-  const mimeType = PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES.find(
-    (supportedMimeType) => supportedMimeType === job.image.mimeType.toLowerCase(),
+  const mimeType = job.image.mimeType.toLowerCase();
+  const supportedImageMimeType = PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES.find(
+    (supportedMimeType) => supportedMimeType === mimeType,
   );
-  if (!mimeType) {
+  if (job.image.type === "image" && !supportedImageMimeType) {
     setUploadState(job.image.id, {
       status: "failed",
       environmentId: job.environmentId,
@@ -120,8 +121,9 @@ async function runUpload(job: UploadJob): Promise<void> {
     {
       environmentId: job.environmentId,
       input: {
+        type: job.image.type,
         name: job.image.name,
-        mimeType,
+        mimeType: supportedImageMimeType ?? mimeType,
         sizeBytes: job.image.file.size,
       },
     },
@@ -372,7 +374,7 @@ export function getUploadedAttachments(input: {
       return null;
     }
     attachments.push({
-      type: "image",
+      type: image.type,
       id: upload.attachmentId,
       name: image.name,
       mimeType: image.mimeType,

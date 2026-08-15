@@ -9,7 +9,7 @@ import { Button } from "../ui/button";
 
 const SNIPPET_MAX_CHARS = 90;
 
-/** Images that did not make it into the entry, whatever the reason. */
+/** Attachments that did not make it into the entry, whatever the reason. */
 function missingImageCount(entry: PromptStashEntry): number {
   return entry.droppedImageNames.length + (entry.unreadableImageNames?.length ?? 0);
 }
@@ -19,8 +19,10 @@ function stashEntrySnippet(entry: PromptStashEntry): string {
   if (trimmed.length > 0) {
     return trimmed.length > SNIPPET_MAX_CHARS ? `${trimmed.slice(0, SNIPPET_MAX_CHARS)}…` : trimmed;
   }
-  const imageCount = entry.attachments.length + entry.droppedImageNames.length;
-  return imageCount > 0 ? `(${imageCount} image${imageCount === 1 ? "" : "s"})` : "(empty)";
+  const attachmentCount = entry.attachments.length + entry.droppedImageNames.length;
+  return attachmentCount > 0
+    ? `(${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"})`
+    : "(empty)";
 }
 
 /**
@@ -154,26 +156,31 @@ export const ComposerStashMenu = memo(function ComposerStashMenu(props: {
                   </span>
                   {entry.pendingImageCount ? (
                     <span className="shrink-0 text-[10px] text-secondary-label">
-                      saving {entry.pendingImageCount} image
+                      saving {entry.pendingImageCount} attachment
                       {entry.pendingImageCount === 1 ? "" : "s"}…
                     </span>
                   ) : missingImageCount(entry) > 0 ? (
                     <span className="shrink-0 text-[10px] text-warning-foreground">
-                      {missingImageCount(entry)} image
+                      {missingImageCount(entry)} attachment
                       {missingImageCount(entry) === 1 ? "" : "s"} dropped
                     </span>
                   ) : null}
-                  {entry.attachments.length > 0 ? (
+                  {entry.attachments.some((attachment) =>
+                    attachment.mimeType.startsWith("image/"),
+                  ) ? (
                     <span className="flex shrink-0 items-center -space-x-1.5">
-                      {entry.attachments.slice(0, 3).map((attachment) => (
-                        <img
-                          key={attachment.id}
-                          src={attachment.dataUrl}
-                          alt=""
-                          aria-hidden="true"
-                          className="size-5 rounded border border-border/70 object-cover"
-                        />
-                      ))}
+                      {entry.attachments
+                        .filter((attachment) => attachment.mimeType.startsWith("image/"))
+                        .slice(0, 3)
+                        .map((attachment) => (
+                          <img
+                            key={attachment.id}
+                            src={attachment.dataUrl}
+                            alt=""
+                            aria-hidden="true"
+                            className="size-5 rounded border border-border/70 object-cover"
+                          />
+                        ))}
                     </span>
                   ) : null}
                   <span className="shrink-0 text-secondary-label text-xs max-sm:hidden">

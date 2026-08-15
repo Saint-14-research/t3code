@@ -9,7 +9,11 @@ import {
   normalizeAttachmentRelativePath,
   resolveAttachmentRelativePath,
 } from "./attachmentPaths.ts";
-import { inferImageExtension, SAFE_IMAGE_FILE_EXTENSIONS } from "./imageMime.ts";
+import {
+  inferAttachmentExtension,
+  inferImageExtension,
+  SAFE_IMAGE_FILE_EXTENSIONS,
+} from "./imageMime.ts";
 
 const ATTACHMENT_FILENAME_EXTENSIONS = [...SAFE_IMAGE_FILE_EXTENSIONS, ".bin"];
 const ATTACHMENT_ID_THREAD_SEGMENT_MAX_CHARS = 80;
@@ -80,6 +84,13 @@ export function attachmentRelativePath(attachment: ChatAttachment): string {
       });
       return `${attachment.id}${extension}`;
     }
+    case "file": {
+      const extension = inferAttachmentExtension({
+        mimeType: attachment.mimeType,
+        fileName: attachment.name,
+      });
+      return `${attachment.id}${extension}`;
+    }
   }
 }
 
@@ -109,6 +120,19 @@ export function resolveAttachmentPathById(input: {
     if (maybePath && NodeFS.existsSync(maybePath)) {
       return maybePath;
     }
+  }
+  try {
+    const matchingName = NodeFS.readdirSync(input.attachmentsDir).find(
+      (name) => parseAttachmentIdFromRelativePath(name) === normalizedId,
+    );
+    if (matchingName) {
+      return resolveAttachmentRelativePath({
+        attachmentsDir: input.attachmentsDir,
+        relativePath: matchingName,
+      });
+    }
+  } catch {
+    return null;
   }
   return null;
 }

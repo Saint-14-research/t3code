@@ -33,7 +33,7 @@ import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model"
 import { useMemo } from "react";
 import { getLocalStorageItem } from "./hooks/useLocalStorage";
 import { resolveAppModelSelection, resolveAppModelSelectionForInstance } from "./modelSelection";
-import { DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, type ChatImageAttachment } from "./types";
+import { DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, type ChatAttachment } from "./types";
 import {
   type TerminalContextDraft,
   ensureInlineTerminalContextPlaceholders,
@@ -88,10 +88,10 @@ export const PersistedComposerImageAttachment = Schema.Struct({
 });
 export type PersistedComposerImageAttachment = typeof PersistedComposerImageAttachment.Type;
 
-export interface ComposerImageAttachment extends Omit<ChatImageAttachment, "previewUrl"> {
+export type ComposerImageAttachment = ChatAttachment & {
   previewUrl: string;
   file: File;
-}
+};
 
 const PersistedTerminalContextDraft = Schema.Struct({
   id: Schema.String,
@@ -2172,12 +2172,12 @@ export function hydrateImagesFromPersisted(
 
     return [
       {
-        type: "image" as const,
+        type: attachment.mimeType.startsWith("image/") ? ("image" as const) : ("file" as const),
         id: attachment.id,
         name: attachment.name,
         mimeType: attachment.mimeType,
         sizeBytes: attachment.sizeBytes,
-        previewUrl: attachment.dataUrl,
+        previewUrl: attachment.mimeType.startsWith("image/") ? attachment.dataUrl : "",
         file,
       } satisfies ComposerImageAttachment,
     ];

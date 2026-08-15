@@ -18,7 +18,7 @@ export const MAX_STASH_ENTRIES = 20;
 /**
  * Budget for an entry's serialized attachment payload. localStorage is a
  * ~5MB origin-wide quota shared with the composer draft store, so oversized
- * images are dropped (tracked in `droppedImageNames`) rather than persisted.
+ * attachments are dropped (tracked in `droppedImageNames`) rather than persisted.
  *
  * Sized to hold two images at the per-image compression budget
  * (`MAX_STASH_IMAGE_DATA_URL_CHARS`) so a typical before/after screenshot
@@ -28,7 +28,7 @@ export const MAX_STASH_ENTRY_ATTACHMENT_CHARS = 2_700_000;
 
 /**
  * A stashed prompt carries only what every provider can accept: text and
- * image attachments. Deliberately no provider instance or model selection —
+ * file attachments. Deliberately no provider instance or model selection —
  * the point of stashing is to move a prompt into a different thread or
  * provider, so restoring must never drag the old model choice along.
  */
@@ -37,7 +37,7 @@ const StashEntrySchema = Schema.Struct({
   createdAt: Schema.String,
   prompt: Schema.String,
   attachments: Schema.Array(PersistedComposerImageAttachment),
-  /** Names of images that exceeded the attachment budget and were not saved. */
+  /** Names of attachments that exceeded the budget and were not saved. */
   droppedImageNames: Schema.Array(Schema.String),
   /**
    * Names of images that could not be decoded or re-encoded at all — a
@@ -96,7 +96,7 @@ function clearOrphanedPendingImages(
 /**
  * Splits candidate attachments into a persistable set within the entry
  * budget plus the names of any that had to be dropped. Attachments are
- * admitted in order so the earliest-added images win.
+ * admitted in order so the earliest-added attachments win.
  */
 export function partitionStashAttachments(
   attachments: ReadonlyArray<PersistedComposerImageAttachment>,

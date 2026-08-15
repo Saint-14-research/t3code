@@ -2,6 +2,8 @@ import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
+  CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES,
   ProjectFaviconPath,
@@ -42,14 +44,28 @@ export type AssetCreateUrlResult = typeof AssetCreateUrlResult.Type;
 
 export const ATTACHMENT_UPLOAD_URL_TTL_MS = 10 * 60_000;
 
-export const AttachmentCreateUploadUrlInput = Schema.Struct({
-  name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
-  mimeType: Schema.Literals(PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES),
-  sizeBytes: NonNegativeInt.check(
-    Schema.isGreaterThanOrEqualTo(1),
-    Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES),
-  ),
-});
+export const AttachmentCreateUploadUrlInput = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("image"),
+    name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+    mimeType: Schema.Literals(PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES),
+    sizeBytes: NonNegativeInt.check(
+      Schema.isGreaterThanOrEqualTo(1),
+      Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES),
+    ),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("file"),
+    name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+    mimeType: TrimmedNonEmptyString.check(
+      Schema.isMaxLength(CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS),
+    ),
+    sizeBytes: NonNegativeInt.check(
+      Schema.isGreaterThanOrEqualTo(1),
+      Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_FILE_BYTES),
+    ),
+  }),
+]);
 export type AttachmentCreateUploadUrlInput = typeof AttachmentCreateUploadUrlInput.Type;
 
 export const AttachmentCreateUploadUrlResult = Schema.Struct({

@@ -28,6 +28,7 @@ import { OtlpTracer } from "effect/unstable/observability";
 
 import * as ServerConfig from "./config.ts";
 import { ASSET_ROUTE_PREFIX, resolveAsset } from "./assets/AssetAccess.ts";
+import { SAFE_IMAGE_FILE_EXTENSIONS } from "./imageMime.ts";
 import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   storeAttachmentUpload,
@@ -52,15 +53,18 @@ const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inlin
 
 export function assetResponseHeaders(filePath: string): Record<string, string> {
   const lowerPath = filePath.toLowerCase();
+  const extension = /\.[a-z0-9]+$/i.exec(lowerPath)?.[0] ?? "";
+  const isSafeImageExtension = SAFE_IMAGE_FILE_EXTENSIONS.has(extension);
   return {
     "Cache-Control": "private, max-age=3600",
     "X-Content-Type-Options": "nosniff",
     ...(lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
       ? { "Content-Type": "text/html; charset=utf-8" }
       : {}),
-    ...(lowerPath.endsWith(".svg")
+    ...(extension === ".svg" || !isSafeImageExtension
       ? { "Content-Security-Policy": SVG_CONTENT_SECURITY_POLICY }
       : {}),
+    ...(!isSafeImageExtension ? { "Content-Disposition": "attachment" } : {}),
   };
 }
 

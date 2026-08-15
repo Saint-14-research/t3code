@@ -202,6 +202,37 @@ function MessageAttachmentImage(props: {
   );
 }
 
+function MessageAttachmentFile(props: {
+  readonly name: string;
+  readonly userMessage: boolean;
+  readonly iconTintColor: ColorValue;
+  readonly className?: string;
+}) {
+  return (
+    <View
+      accessible
+      accessibilityLabel={`Attached file ${props.name}`}
+      className={cn("flex-row items-center gap-2 rounded-xl px-3 py-2", props.className)}
+    >
+      <SymbolView
+        name="doc.text"
+        size={15}
+        tintColor={props.userMessage ? "#ffffff" : props.iconTintColor}
+        type="monochrome"
+      />
+      <Text
+        numberOfLines={2}
+        className={cn(
+          "min-w-0 flex-1 font-t3-medium text-xs",
+          props.userMessage ? "text-white" : "text-foreground-muted",
+        )}
+      >
+        {props.name}
+      </Text>
+    </View>
+  );
+}
+
 function ThreadMarkdownImageView(props: {
   readonly uri: string | null;
   readonly sourceKey: string;
@@ -1088,13 +1119,21 @@ function renderFeedEntry(
               />
             ) : null}
             {attachments.map((attachment) => {
-              return (
+              return attachment.type === "image" ? (
                 <MessageAttachmentImage
                   key={attachment.id}
                   environmentId={props.environmentId}
                   attachmentId={attachment.id}
                   className="aspect-[1.3] w-full rounded-[14px] bg-white/15"
                   onPressImage={props.onPressImage}
+                />
+              ) : (
+                <MessageAttachmentFile
+                  key={attachment.id}
+                  name={attachment.name}
+                  userMessage
+                  iconTintColor={iconSubtleColor}
+                  className="bg-white/10"
                 />
               );
             })}
@@ -1150,13 +1189,21 @@ function renderFeedEntry(
           )
         ) : null}
         {attachments.map((attachment) => {
-          return (
+          return attachment.type === "image" ? (
             <MessageAttachmentImage
               key={attachment.id}
               environmentId={props.environmentId}
               attachmentId={attachment.id}
               className="mt-1.5 aspect-[1.3] w-full rounded-[18px] bg-neutral-200 dark:bg-neutral-800"
               onPressImage={props.onPressImage}
+            />
+          ) : (
+            <MessageAttachmentFile
+              key={attachment.id}
+              name={attachment.name}
+              userMessage={false}
+              iconTintColor={iconSubtleColor}
+              className="mt-1.5 bg-neutral-100 dark:bg-neutral-900"
             />
           );
         })}
