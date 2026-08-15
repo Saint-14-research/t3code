@@ -92,6 +92,7 @@ const resolveDesktopSshCliRunner = (
       nodeEngineRange: serverPackageJson.engines.node,
     };
   }
+  const remoteDesktopAppContents = `/Applications/${environment.displayName}.app/Contents`;
   return {
     packageSpec: resolveRemoteT3CliPackageSpec({
       appVersion: environment.appVersion,
@@ -99,6 +100,15 @@ const resolveDesktopSshCliRunner = (
       isDevelopment: environment.isDevelopment,
     }),
     nodeEngineRange: serverPackageJson.engines.node,
+    ...(environment.isPackaged && environment.platform === "darwin"
+      ? {
+          desktopCli: {
+            executablePath: `${remoteDesktopAppContents}/MacOS/${environment.displayName}`,
+            entryPath: `${remoteDesktopAppContents}/Resources/app.asar/apps/server/dist/bin.mjs`,
+            version: environment.appVersion,
+          },
+        }
+      : {}),
   };
 };
 

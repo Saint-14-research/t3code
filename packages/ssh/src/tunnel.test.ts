@@ -104,6 +104,7 @@ describe("ssh tunnel scripts", () => {
     const script = buildRemoteT3RunnerScript({ nodeEngineRange: TEST_NODE_ENGINE_RANGE });
 
     assert.include(script, "T3_NODE_SCRIPT_PATH=''");
+    assert.include(script, "T3_DESKTOP_CLI_EXECUTABLE=''");
     assert.include(script, 'exec t3 "$@"');
     assert.include(script, "exec npx --yes 't3@latest' \"$@\"");
     assert.include(script, "exec npm exec --yes 't3@latest' -- \"$@\"");
@@ -127,6 +128,33 @@ describe("ssh tunnel scripts", () => {
     assert.include(script, "nvm use --silent default");
     assert.include(script, 'for T3_NODE_BIN in "$NVM_DIR"/versions/node/*/bin');
     assert.notInclude(script, "ensure $NVM_DIR/nvm.sh is available");
+  });
+
+  it("prefers a matching installed desktop CLI before the package fallback", () => {
+    const script = buildRemoteT3RunnerScript({
+      packageSpec: "t3@0.0.33",
+      desktopCli: {
+        executablePath: "/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)",
+        entryPath:
+          "/Applications/T3 Code (Alpha).app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
+        version: "0.0.33",
+      },
+    });
+
+    assert.include(
+      script,
+      "T3_DESKTOP_CLI_EXECUTABLE='/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)'",
+    );
+    assert.include(script, 'T3_INSTALLED_DESKTOP_CLI_VERSION="$(env ELECTRON_RUN_AS_NODE=1');
+    assert.include(
+      script,
+      'if [ "$T3_INSTALLED_DESKTOP_CLI_VERSION" = "t3 v$T3_DESKTOP_CLI_VERSION" ]; then',
+    );
+    assert.include(
+      script,
+      'exec env ELECTRON_RUN_AS_NODE=1 "$T3_DESKTOP_CLI_EXECUTABLE" "$T3_DESKTOP_CLI_ENTRY" "$@"',
+    );
+    assert.include(script, "exec npx --yes 't3@0.0.33' \"$@\"");
   });
 
   it("does not hard-code a remote node engine range", () => {
@@ -216,6 +244,11 @@ describe("ssh tunnel scripts", () => {
     assert.include(
       buildRemoteLaunchScript(),
       'DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port',
+    );
+    assert.include(buildRemoteLaunchScript(), '[ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]');
+    assert.isBelow(
+      buildRemoteLaunchScript().indexOf('[ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]'),
+      buildRemoteLaunchScript().indexOf('if [ -n "$DEFAULT_REMOTE_PORT" ]; then'),
     );
     assert.include(
       buildRemoteLaunchScript(),
