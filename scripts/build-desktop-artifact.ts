@@ -52,6 +52,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
+const DEFAULT_DESKTOP_UPDATE_REPOSITORY = "pingdotgg/t3code";
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
@@ -101,6 +102,7 @@ const readWorkspaceConfig = Effect.fn("readWorkspaceConfig")(function* () {
 
 interface DesktopBuildIconAssets {
   readonly macIconPng: string;
+  readonly macIconIcns?: string;
   readonly linuxIconPng: string;
   readonly windowsIconIco: string;
 }
@@ -1796,7 +1798,12 @@ function generateMacIconSet(
   });
 }
 
-function stageMacIcons(stageResourcesDir: string, sourcePng: string, verbose: boolean) {
+function stageMacIcons(
+  stageResourcesDir: string,
+  sourcePng: string,
+  sourceIcns: string | undefined,
+  verbose: boolean,
+) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -1818,6 +1825,11 @@ function stageMacIcons(stageResourcesDir: string, sourcePng: string, verbose: bo
       label: "sips mac icon",
       verbose,
     });
+
+    if (sourceIcns && (yield* fs.exists(sourceIcns))) {
+      yield* fs.copyFile(sourceIcns, iconIcnsPath);
+      return;
+    }
 
     yield* generateMacIconSet(sourcePng, iconIcnsPath, tmpRoot, path, verbose);
   });
@@ -1997,7 +2009,7 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
   const rawRepo = (
     Option.getOrUndefined(env.updateRepository)?.trim() ||
     Option.getOrUndefined(env.githubRepository)?.trim() ||
-    ""
+    DEFAULT_DESKTOP_UPDATE_REPOSITORY
   ).trim();
   if (!rawRepo) return undefined;
 
@@ -2036,6 +2048,7 @@ export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIcon
 
   return {
     macIconPng: BRAND_ASSET_PATHS.productionMacIconPng,
+    macIconIcns: "apps/desktop/resources/icon.icns",
     linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
     windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
   };
@@ -2210,7 +2223,7 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
   verbose: boolean,
 ) {
   if (platform === "mac") {
-    yield* stageMacIcons(stageResourcesDir, iconAssets.macIconPng, verbose);
+    yield* stageMacIcons(stageResourcesDir, iconAssets.macIconPng, iconAssets.macIconIcns, verbose);
     return;
   }
 
@@ -2886,6 +2899,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     stageResourcesDir,
     {
       macIconPng: path.join(repoRoot, iconAssets.macIconPng),
+      ...(iconAssets.macIconIcns
+        ? { macIconIcns: path.join(repoRoot, iconAssets.macIconIcns) }
+        : {}),
       linuxIconPng: path.join(repoRoot, iconAssets.linuxIconPng),
       windowsIconIco: path.join(repoRoot, iconAssets.windowsIconIco),
     },
