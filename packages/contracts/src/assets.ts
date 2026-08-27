@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -46,7 +47,9 @@ export const ATTACHMENT_UPLOAD_URL_TTL_MS = 10 * 60_000;
 
 export const AttachmentCreateUploadUrlInput = Schema.Union([
   Schema.Struct({
-    type: Schema.Literal("image"),
+    type: Schema.Literal("image").pipe(
+      Schema.withDecodingDefault(Effect.succeed("image" as const)),
+    ),
     name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
     mimeType: Schema.Literals(PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES),
     sizeBytes: NonNegativeInt.check(

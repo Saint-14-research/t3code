@@ -166,7 +166,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("switches desktop packaging icons to the nightly artwork for nightly versions", () => {
     assert.deepStrictEqual(resolveDesktopBuildIconAssets("0.0.17"), {
       macIconPng: BRAND_ASSET_PATHS.productionMacIconPng,
-      macIconIcns: "apps/desktop/resources/icon.icns",
       linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
       windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
     });
@@ -263,18 +262,13 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
-  it.effect("uses the canonical update feed for local desktop builds", () =>
+  it.effect("omits the update feed unless a maintained repository is configured", () =>
     Effect.gen(function* () {
       const config = yield* resolveGitHubPublishConfig("latest").pipe(
         Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
       );
 
-      assert.deepStrictEqual(config, {
-        provider: "github",
-        owner: "pingdotgg",
-        repo: "t3code",
-        releaseType: "release",
-      });
+      assert.isUndefined(config);
     }),
   );
 

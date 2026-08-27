@@ -32,6 +32,20 @@ export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 
+export function collectServerImageAttachmentIds(
+  messages: ReadonlyArray<Pick<ChatMessage, "attachments">>,
+): string[] {
+  const attachmentIds = new Set<string>();
+  for (const message of messages) {
+    for (const attachment of message.attachments ?? []) {
+      if (attachment.type === "image") {
+        attachmentIds.add(attachment.id);
+      }
+    }
+  }
+  return [...attachmentIds];
+}
+
 export function shouldDockDraftHeroForSubmission(input: {
   isDraftHeroState: boolean;
   activeThreadKey: string | null;

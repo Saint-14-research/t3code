@@ -16,6 +16,7 @@ import {
   buildExpiredTerminalContextToastCopy,
   buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
+  collectServerImageAttachmentIds,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
@@ -43,6 +44,44 @@ const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");
 const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
+
+describe("collectServerImageAttachmentIds", () => {
+  it("requests preview URLs only for server-backed images", () => {
+    expect(
+      collectServerImageAttachmentIds([
+        {
+          attachments: [
+            {
+              type: "image",
+              id: "image-1",
+              name: "screenshot.png",
+              mimeType: "image/png",
+              sizeBytes: 3,
+            },
+            {
+              type: "file",
+              id: "file-1",
+              name: "report.pdf",
+              mimeType: "application/pdf",
+              sizeBytes: 4,
+            },
+          ],
+        },
+        {
+          attachments: [
+            {
+              type: "image",
+              id: "image-1",
+              name: "duplicate.png",
+              mimeType: "image/png",
+              sizeBytes: 3,
+            },
+          ],
+        },
+      ]),
+    ).toEqual(["image-1"]);
+  });
+});
 
 describe("draft hero submission transition", () => {
   it("does not dock the composer before a background submission", () => {

@@ -533,6 +533,32 @@ describe("MessagesTimeline", () => {
     expect(onAnchorReady).toHaveBeenCalledWith(firstEntry.message.id, 0);
   });
 
+  it("renders file attachments as files even if a stale preview URL is present", () => {
+    const entry = {
+      ...buildUserTimelineEntry("Inspect this file."),
+      message: {
+        ...buildUserTimelineEntry("Inspect this file.").message,
+        attachments: [
+          {
+            type: "file" as const,
+            id: "attachment-file",
+            name: "report.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 4,
+            previewUrl: "https://example.invalid/report.pdf",
+          },
+        ],
+      },
+    };
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
+    );
+
+    expect(markup).toContain("report.pdf");
+    expect(markup).not.toContain("example.invalid");
+    expect(markup).not.toContain("<img");
+  });
+
   it("does not reserve end space for a follow-up user message", () => {
     const onAnchorReady = vi.fn();
     const firstEntry = buildUserTimelineEntry("First prompt.");

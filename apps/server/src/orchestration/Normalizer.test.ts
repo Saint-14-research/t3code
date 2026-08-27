@@ -133,6 +133,43 @@ describe("normalizeDispatchCommand attachments", () => {
     }).pipe(Effect.provide(normalizerTestLayer)),
   );
 
+  it.effect("normalizes uppercase data URL image media types", () =>
+    Effect.gen(function* () {
+      const normalized = yield* normalizeDispatchCommand({
+        type: "thread.turn.start",
+        commandId: CommandId.make("command-uppercase-image"),
+        threadId: ThreadId.make("thread-uppercase-image"),
+        message: {
+          messageId: MessageId.make("message-uppercase-image"),
+          role: "user",
+          text: "Inspect this",
+          attachments: [
+            {
+              type: "file",
+              name: "image.png",
+              mimeType: "application/octet-stream",
+              sizeBytes: 1,
+              dataUrl: "data:IMAGE/PNG;base64,iA==",
+            },
+          ],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: clientCreatedAt,
+      });
+      if (normalized.type !== "thread.turn.start") {
+        throw new Error("Expected a thread.turn.start command");
+      }
+
+      expect(normalized.message.attachments[0]).toMatchObject({
+        type: "image",
+        name: "image.png",
+        mimeType: "image/png",
+        sizeBytes: 1,
+      });
+    }).pipe(Effect.provide(normalizerTestLayer)),
+  );
+
   it.effect("rejects a data URL media type longer than the persisted contract allows", () =>
     Effect.gen(function* () {
       const error = yield* normalizeDispatchCommand({

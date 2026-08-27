@@ -8,6 +8,7 @@ import {
 } from "./orchestration.ts";
 
 const isUploadInput = Schema.is(AttachmentCreateUploadUrlInput);
+const decodeUploadInput = Schema.decodeUnknownSync(AttachmentCreateUploadUrlInput);
 
 const uploadInput = {
   type: "image",
@@ -19,6 +20,16 @@ const uploadInput = {
 describe("AttachmentCreateUploadUrlInput", () => {
   it("accepts supported image attachments", () => {
     expect(isUploadInput(uploadInput)).toBe(true);
+  });
+
+  it("defaults legacy image upload requests that omit the type discriminator", () => {
+    expect(
+      decodeUploadInput({
+        name: "screenshot.png",
+        mimeType: "image/png",
+        sizeBytes: 3,
+      }),
+    ).toMatchObject({ type: "image" });
   });
 
   it("rejects image types that providers do not support", () => {

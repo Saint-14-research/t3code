@@ -204,7 +204,8 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
             });
           }
 
-          if (parsed.mimeType.length > CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS) {
+          const mimeType = parsed.mimeType.toLowerCase();
+          if (mimeType.length > CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS) {
             return yield* new OrchestrationDispatchCommandError({
               message: `Attachment '${attachment.name}' has an invalid media type.`,
             });
@@ -225,10 +226,10 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           }
 
           const persistedAttachment = {
-            type: parsed.mimeType.startsWith("image/") ? ("image" as const) : ("file" as const),
+            type: mimeType.startsWith("image/") ? ("image" as const) : ("file" as const),
             id: attachmentId,
             name: attachment.name,
-            mimeType: parsed.mimeType,
+            mimeType,
             sizeBytes: bytes.byteLength,
           };
 

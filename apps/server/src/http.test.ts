@@ -36,6 +36,10 @@ describe("assetResponseHeaders", () => {
     expect(assetResponseHeaders("/attachments/user-image.SVG", "attachment")).toHaveProperty(
       "Content-Security-Policy",
     );
+    expect(assetResponseHeaders("/attachments/user-image.svg", "attachment")).toHaveProperty(
+      "Content-Disposition",
+      "attachment",
+    );
   });
 
   it("does not apply document policy to raster images", () => {

@@ -58,7 +58,8 @@ export function assetResponseHeaders(
   const lowerPath = filePath.toLowerCase();
   const extension = /\.[a-z0-9]+$/i.exec(lowerPath)?.[0] ?? "";
   const isSafeImageExtension = SAFE_IMAGE_FILE_EXTENSIONS.has(extension);
-  const forceAttachmentDownload = source === "attachment" && !isSafeImageExtension;
+  const forceAttachmentDownload =
+    source === "attachment" && (!isSafeImageExtension || extension === ".svg");
   return {
     "Cache-Control": "private, max-age=3600",
     "X-Content-Type-Options": "nosniff",
