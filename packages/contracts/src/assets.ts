@@ -57,9 +57,7 @@ export const AttachmentCreateUploadUrlInput = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("file"),
     name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
-    mimeType: TrimmedNonEmptyString.check(
-      Schema.isMaxLength(CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS),
-    ),
+    mimeType: TrimmedNonEmptyString.check(Schema.isMaxLength(CHAT_ATTACHMENT_MIME_TYPE_MAX_CHARS)),
     sizeBytes: NonNegativeInt.check(
       Schema.isGreaterThanOrEqualTo(1),
       Schema.isLessThanOrEqualTo(PROVIDER_SEND_TURN_MAX_FILE_BYTES),

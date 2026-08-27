@@ -22,7 +22,7 @@ describe("ComposerStashMenu", () => {
     expect(markup).not.toContain("Stashed prompts");
   });
 
-  it("shows saved image thumbnails and incomplete image states", () => {
+  it("shows image thumbnails and generic attachment states", () => {
     const markup = renderToStaticMarkup(
       <ComposerStashMenu
         entries={[
@@ -37,6 +37,13 @@ describe("ComposerStashMenu", () => {
                 mimeType: "image/png",
                 sizeBytes: 128,
                 dataUrl: "data:image/png;base64,AA==",
+              },
+              {
+                id: "file-one",
+                name: "notes.txt",
+                mimeType: "text/plain",
+                sizeBytes: 5,
+                dataUrl: "data:text/plain;base64,bm90ZXM=",
               },
             ],
             droppedImageNames: ["after.png"],
@@ -60,8 +67,9 @@ describe("ComposerStashMenu", () => {
     );
 
     expect(markup).toContain('src="data:image/png;base64,AA=="');
-    expect(markup).toContain("1 image dropped");
-    expect(markup).toContain("saving 1 image");
+    expect(markup).not.toContain('src="data:text/plain;base64,bm90ZXM="');
+    expect(markup).toContain("1 attachment dropped");
+    expect(markup).toContain("saving 1 attachment");
     expect(markup).not.toContain("absolute top-1/2 right-2");
     expect(markup).toContain("pointer-events-none");
     expect(markup).toContain("pointer-coarse:pointer-events-auto");

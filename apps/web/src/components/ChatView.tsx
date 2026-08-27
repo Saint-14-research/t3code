@@ -5642,7 +5642,10 @@ function ChatViewContent(props: ChatViewProps) {
       await awaitAttachmentUploads(composerImagesSnapshot.map((image) => image.id));
       if (getUploadedAttachments({ environmentId, images: composerImagesSnapshot }) === null) {
         sendInFlightRef.current = false;
-        setThreadError(threadIdForSend, "Retry or remove failed attachment uploads before sending.");
+        setThreadError(
+          threadIdForSend,
+          "Retry or remove failed attachment uploads before sending.",
+        );
         return;
       }
     }
@@ -5687,13 +5690,22 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return uploaded;
         }
-        return {
-          type: image.type,
-          name: image.name,
-          mimeType: image.mimeType,
-          sizeBytes: image.sizeBytes,
-          dataUrl: await readFileAsDataUrl(image.file),
-        };
+        const dataUrl = await readFileAsDataUrl(image.file);
+        return image.type === "image"
+          ? {
+              type: "image" as const,
+              name: image.name,
+              mimeType: image.mimeType,
+              sizeBytes: image.sizeBytes,
+              dataUrl,
+            }
+          : {
+              type: "file" as const,
+              name: image.name,
+              mimeType: image.mimeType,
+              sizeBytes: image.sizeBytes,
+              dataUrl,
+            };
       }),
     );
     const optimisticAttachments = composerImagesSnapshot.map((image) => ({

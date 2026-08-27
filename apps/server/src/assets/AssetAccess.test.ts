@@ -319,12 +319,16 @@ describe("AssetAccess", () => {
       expect(result.relativeUrl).toMatch(/\/v[0-9a-f]{64}-custom\.png$/);
       expect(
         yield* resolveAsset(suffix.slice(0, separatorIndex), suffix.slice(separatorIndex + 1)),
-      ).toEqual({ kind: "file", path: canonicalPath });
+      ).toEqual({ kind: "file", path: canonicalPath, source: "workspace" });
       const tamperedSuffixResult = yield* resolveAsset(
         suffix.slice(0, separatorIndex),
         "sibling.png",
       );
-      expect(tamperedSuffixResult).toEqual({ kind: "file", path: canonicalPath });
+      expect(tamperedSuffixResult).toEqual({
+        kind: "file",
+        path: canonicalPath,
+        source: "workspace",
+      });
       expect(tamperedSuffixResult).not.toEqual({ kind: "file", path: canonicalSiblingPath });
     }).pipe(Effect.provide(testLayer)),
   );

@@ -120,12 +120,20 @@ async function runUpload(job: UploadJob): Promise<void> {
     attachmentEnvironment.createUploadUrl,
     {
       environmentId: job.environmentId,
-      input: {
-        type: job.image.type,
-        name: job.image.name,
-        mimeType: supportedImageMimeType ?? mimeType,
-        sizeBytes: job.image.file.size,
-      },
+      input:
+        job.image.type === "image"
+          ? {
+              type: "image",
+              name: job.image.name,
+              mimeType: supportedImageMimeType!,
+              sizeBytes: job.image.file.size,
+            }
+          : {
+              type: "file",
+              name: job.image.name,
+              mimeType,
+              sizeBytes: job.image.file.size,
+            },
     },
     { reportFailure: false },
   );

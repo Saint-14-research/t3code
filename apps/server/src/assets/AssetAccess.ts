@@ -494,7 +494,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       Effect.orElseSucceed(() => null),
     );
     return faviconPath === claims.filePath
-      ? ({ kind: "file", path: faviconPath } satisfies ResolvedAsset)
+      ? ({ kind: "file", path: faviconPath, source: "workspace" } satisfies ResolvedAsset)
       : null;
   }
 

@@ -46,11 +46,11 @@ describe("assetResponseHeaders", () => {
   });
 
   it("declares utf-8 for HTML assets so non-ASCII content renders correctly", () => {
-    expect(assetResponseHeaders("/workspace/page.html")).toHaveProperty(
+    expect(assetResponseHeaders("/workspace/page.html", "workspace")).toHaveProperty(
       "Content-Type",
       "text/html; charset=utf-8",
     );
-    expect(assetResponseHeaders("/workspace/PAGE.HTM")).toHaveProperty(
+    expect(assetResponseHeaders("/workspace/PAGE.HTM", "workspace")).toHaveProperty(
       "Content-Type",
       "text/html; charset=utf-8",
     );
@@ -71,6 +71,7 @@ describe("assetResponseHeaders", () => {
   it("keeps workspace browser-preview assets renderable", () => {
     expect(assetResponseHeaders("/workspace/report.html", "workspace")).toEqual({
       "Cache-Control": "private, max-age=3600",
+      "Content-Type": "text/html; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
     });
     expect(assetResponseHeaders("/workspace/report.pdf", "workspace")).not.toHaveProperty(
