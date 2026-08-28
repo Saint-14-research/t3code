@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NetService from "@t3tools/shared/Net";
 import * as Duration from "effect/Duration";
@@ -13,6 +14,7 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { SshPasswordPrompt } from "./auth.ts";
+import { collectProcessOutput } from "./command.ts";
 import {
   buildRemoteLaunchScript,
   buildRemotePairingScript,
@@ -21,6 +23,7 @@ import {
   describeReadinessCause,
   issueRemotePairingToken,
   launchOrReuseRemoteServer,
+  REMOTE_DISCOVER_T3_SERVER_SCRIPT,
   REMOTE_PICK_PORT_SCRIPT,
   SshEnvironmentManager,
   waitForHttpReady,
@@ -98,6 +101,42 @@ const testNetService = NetService.NetService.of({
 function commandArgs(command: ChildProcess.Command): ReadonlyArray<string> {
   return command._tag === "StandardCommand" ? command.args : [];
 }
+
+const runT3DiscoveryProbe = (port: number) =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(
+      ChildProcess.make(process.execPath, ["-", String(port), "1000"], {
+        stdin: {
+          stream: Stream.make(new TextEncoder().encode(REMOTE_DISCOVER_T3_SERVER_SCRIPT)),
+          endOnDone: true,
+        },
+      }),
+    );
+    const [stdout, exitCode] = yield* Effect.all([
+      collectProcessOutput(child.stdout),
+      child.exitCode.pipe(Effect.map(Number)),
+    ]);
+    return { exitCode, stdout };
+  });
+
+const discoveryServerFixture = new URL("./testFixtures/t3DiscoveryServer.mjs", import.meta.url)
+  .pathname;
+
+const startDiscoveryServer = (mode: "generic" | "t3") =>
+  Effect.gen(function* () {
+    const net = yield* NetService.NetService;
+    const port = yield* net.reserveLoopbackPort();
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(
+      ChildProcess.make(process.execPath, [discoveryServerFixture, mode, String(port)]),
+    );
+    yield* waitForHttpReady({
+      baseUrl: "http://127.0.0.1:" + String(port) + "/",
+      timeoutMs: 2_000,
+    });
+    return { child, port };
+  });
 
 describe("ssh tunnel scripts", () => {
   it("builds the remote t3 runner with npx and npm fallbacks", () => {
@@ -245,9 +284,14 @@ describe("ssh tunnel scripts", () => {
       buildRemoteLaunchScript(),
       'DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port',
     );
-    assert.include(buildRemoteLaunchScript(), '[ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]');
+    assert.include(
+      buildRemoteLaunchScript(),
+      'is_same_process_tree "$REMOTE_PID" "$DEFAULT_RUNTIME_PID"',
+    );
     assert.isBelow(
-      buildRemoteLaunchScript().indexOf('[ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]'),
+      buildRemoteLaunchScript().indexOf(
+        'is_same_process_tree "$REMOTE_PID" "$DEFAULT_RUNTIME_PID"',
+      ),
       buildRemoteLaunchScript().indexOf('if [ -n "$DEFAULT_REMOTE_PORT" ]; then'),
     );
     assert.include(
@@ -258,6 +302,15 @@ describe("ssh tunnel scripts", () => {
     assert.include(buildRemoteLaunchScript(), 'REMOTE_PORT="$DEFAULT_REMOTE_PORT"');
     assert.include(buildRemoteLaunchScript(), 'rm -f "$PID_FILE"');
     assert.include(buildRemoteLaunchScript(), "printf 'external\\n' >\"$MANAGED_FILE\"");
+    assert.include(buildRemoteLaunchScript(), "discover_default_t3_server()");
+    assert.include(
+      buildRemoteLaunchScript(),
+      'DISCOVERED_REMOTE_PORT="$(discover_default_t3_server',
+    );
+    assert.include(
+      buildRemoteLaunchScript(),
+      'MANAGED_RUNTIME_INFO="$(resolve_default_runtime_port',
+    );
     assert.include(buildRemoteLaunchScript(), 'if [ -z "$REMOTE_PORT" ]; then');
     assert.isBelow(
       buildRemoteLaunchScript().indexOf('if [ "$REMOTE_MANAGED" = "managed" ]'),
@@ -319,6 +372,38 @@ describe("ssh tunnel scripts", () => {
   it("allows the remote port picker to run without a state file path", () => {
     assert.include(REMOTE_PICK_PORT_SCRIPT, 'const filePath = process.argv[2] ?? "";');
   });
+
+  it.live("discovers a live T3 server without relying on its runtime descriptor", () =>
+    Effect.gen(function* () {
+      const { port } = yield* Effect.acquireRelease(startDiscoveryServer("t3"), ({ child }) =>
+        child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 }).pipe(Effect.ignore),
+      );
+      const result = yield* runT3DiscoveryProbe(port);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.stdout, String(port));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, NetService.layer),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.live("does not reuse an unrelated HTTP listener as a T3 server", () =>
+    Effect.gen(function* () {
+      const { port } = yield* Effect.acquireRelease(startDiscoveryServer("generic"), ({ child }) =>
+        child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 }).pipe(Effect.ignore),
+      );
+      const result = yield* runT3DiscoveryProbe(port);
+      assert.notEqual(result.exitCode, 0);
+      assert.equal(result.stdout, "");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, NetService.layer),
+      ),
+      Effect.scoped,
+    ),
+  );
 
   it.effect("bounds each HTTP readiness probe so retries cannot hang on one request", () =>
     Effect.gen(function* () {

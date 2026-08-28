@@ -323,6 +323,55 @@ function probe() {
 })().catch(() => process.exit(1));
 `;
 
+export const REMOTE_DISCOVER_T3_SERVER_SCRIPT = `const http = require("node:http");
+const port = Number.parseInt(process.argv[2] ?? "", 10);
+const probeTimeoutMs = Number.parseInt(process.argv[3] ?? "", 10);
+if (!Number.isInteger(port) || !Number.isInteger(probeTimeoutMs)) {
+  process.exit(1);
+}
+
+const request = http.get(
+  {
+    hostname: "127.0.0.1",
+    port,
+    path: "/.well-known/t3/environment",
+    timeout: probeTimeoutMs,
+  },
+  (response) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) {
+        request.destroy();
+      }
+    });
+    response.once("end", () => {
+      try {
+        const descriptor = JSON.parse(body);
+        const isT3 =
+          response.statusCode >= 200 &&
+          response.statusCode < 300 &&
+          typeof descriptor === "object" &&
+          descriptor !== null &&
+          typeof descriptor.environmentId === "string" &&
+          descriptor.environmentId.trim().length > 0 &&
+          typeof descriptor.serverVersion === "string" &&
+          descriptor.serverVersion.trim().length > 0;
+        if (!isT3) {
+          process.exit(1);
+        }
+        process.stdout.write(String(port));
+      } catch {
+        process.exit(1);
+      }
+    });
+  },
+);
+request.once("timeout", () => request.destroy());
+request.once("error", () => process.exit(1));
+`;
+
 export const REMOTE_NODE_ENV_SCRIPT = `prepend_path_if_dir() {
   if [ -d "$1" ]; then
     case ":$PATH:" in
@@ -506,6 +555,11 @@ wait_ready() {
 @@T3_WAIT_READY_SCRIPT@@
 NODE
 }
+discover_default_t3_server() {
+  node - "@@T3_DEFAULT_REMOTE_PORT@@" "@@T3_READY_PROBE_TIMEOUT_MS@@" <<'NODE'
+@@T3_DISCOVER_T3_SERVER_SCRIPT@@
+NODE
+}
 wait_for_pid_exit() {
   PID_TO_WAIT="$1"
   WAIT_COUNT=0
@@ -513,6 +567,17 @@ wait_for_pid_exit() {
     WAIT_COUNT=$((WAIT_COUNT + 1))
     sleep 0.1
   done
+}
+is_same_process_tree() {
+  ROOT_PID="$1"
+  CURRENT_PID="$2"
+  while [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" -gt 1 ] 2>/dev/null; do
+    if [ "$CURRENT_PID" = "$ROOT_PID" ]; then
+      return 0
+    fi
+    CURRENT_PID="$(ps -o ppid= -p "$CURRENT_PID" 2>/dev/null | tr -d '[:space:]')"
+  done
+  return 1
 }
 resolve_default_runtime_port() {
   node - "$DEFAULT_RUNTIME_FILE" <<'NODE'
@@ -547,8 +612,12 @@ if [ -n "$DEFAULT_RUNTIME_INFO" ]; then
   DEFAULT_REMOTE_PORT="\${DEFAULT_RUNTIME_INFO#* }"
 fi
 # The shared runtime descriptor also points at SSH-managed servers. Never
-# mistake our own PID for a desktop-owned backend and relabel it as external.
-if [ -n "$DEFAULT_RUNTIME_PID" ] && [ -n "$REMOTE_PID" ] && [ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]; then
+# mistake our own process tree for a desktop-owned backend and relabel it as
+# external. npm can keep a wrapper parent between this launcher and T3's node
+# process, so equality alone is insufficient.
+if [ -n "$DEFAULT_RUNTIME_PID" ] && [ -n "$REMOTE_PID" ] && [ "$REMOTE_MANAGED" = "managed" ] && is_same_process_tree "$REMOTE_PID" "$DEFAULT_RUNTIME_PID"; then
+  REMOTE_PID="$DEFAULT_RUNTIME_PID"
+  printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
   DEFAULT_RUNTIME_PID=""
   DEFAULT_REMOTE_PORT=""
 fi
@@ -605,6 +674,17 @@ else
   REMOTE_MANAGED=""
 fi
 if [ -z "$REMOTE_PORT" ]; then
+  DISCOVERED_REMOTE_PORT="$(discover_default_t3_server 2>/dev/null || true)"
+  if [ -n "$DISCOVERED_REMOTE_PORT" ]; then
+    REMOTE_PID=""
+    REMOTE_PORT="$DISCOVERED_REMOTE_PORT"
+    REMOTE_MANAGED="external"
+    rm -f "$PID_FILE"
+    printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
+    printf 'external\\n' >"$MANAGED_FILE"
+  fi
+fi
+if [ -z "$REMOTE_PORT" ]; then
   REMOTE_PORT="$(pick_port)" || true
   if [ -z "$REMOTE_PORT" ]; then
     printf 'Failed to find an available port on the remote host. Ensure node is available on PATH.\\n' >&2
@@ -626,6 +706,13 @@ if [ -z "$REMOTE_PORT" ]; then
     wait_for_pid_exit "$REMOTE_PID"
     rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
     exit 1
+  fi
+  MANAGED_RUNTIME_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
+  MANAGED_RUNTIME_PID="\${MANAGED_RUNTIME_INFO%% *}"
+  MANAGED_RUNTIME_PORT="\${MANAGED_RUNTIME_INFO#* }"
+  if [ -n "$MANAGED_RUNTIME_INFO" ] && [ "$MANAGED_RUNTIME_PORT" = "$REMOTE_PORT" ] && is_same_process_tree "$REMOTE_PID" "$MANAGED_RUNTIME_PID"; then
+    REMOTE_PID="$MANAGED_RUNTIME_PID"
+    printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
   fi
 fi
 printf '{"remotePort":%s,"serverKind":"%s"}\\n' "$REMOTE_PORT" "\${REMOTE_MANAGED:-managed}"
@@ -702,6 +789,7 @@ export function buildRemoteLaunchScript(input?: RemoteT3RunnerOptions): string {
     T3_RUNNER_SCRIPT: stripTrailingNewlines(buildRemoteT3RunnerScript(input)),
     T3_PICK_PORT_SCRIPT: stripTrailingNewlines(REMOTE_PICK_PORT_SCRIPT),
     T3_WAIT_READY_SCRIPT: stripTrailingNewlines(REMOTE_WAIT_READY_SCRIPT),
+    T3_DISCOVER_T3_SERVER_SCRIPT: stripTrailingNewlines(REMOTE_DISCOVER_T3_SERVER_SCRIPT),
     T3_DEFAULT_REMOTE_PORT: String(DEFAULT_REMOTE_PORT),
     T3_REMOTE_PORT_SCAN_WINDOW: String(REMOTE_PORT_SCAN_WINDOW),
     T3_READY_TIMEOUT_MS: String(REMOTE_READY_TIMEOUT_MS),

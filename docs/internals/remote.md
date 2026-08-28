@@ -165,6 +165,9 @@ hosts, owns password/askpass prompts, and delegates lifecycle to `SshEnvironment
 server, opens a local tunnel, checks HTTP readiness, optionally issues a remote pairing token, and
 returns local HTTP/WS endpoints. Disconnect closes the tunnel and stops the remote server if the
 launcher started it; a server that was already running (marked `external`) is left running.
+Reuse checks both the persisted runtime descriptor and the default port's T3 environment descriptor,
+so stale runtime state cannot make SSH start a second broadcaster. For managed launches, the state
+tracks the actual descendant T3 process instead of an npm wrapper PID.
 
 The desktop main process owns this because it can spawn SSH, manage prompts, write launch scripts,
 and clean up forwards. The renderer connects through the forwarded URL like any other environment and
