@@ -152,7 +152,6 @@ describe("CodexCollabLifecycleBridge", () => {
         tool_name: "spawn_agent",
         tool_use_id: "prepared-call",
         tool_input: {
-          message: `Codex delegated task name: ${token}`,
           agent_type: "reviewer",
           task_source: "prepared-host-registration",
           prepared_task_token: token,

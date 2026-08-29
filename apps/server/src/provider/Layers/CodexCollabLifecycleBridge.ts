@@ -34,7 +34,7 @@ export type CodexCollabLifecycleHookPayload =
       readonly tool_name: "spawn_agent" | "followup_task";
       readonly tool_use_id: string;
       readonly tool_input: {
-        readonly message: string;
+        readonly message?: string;
         readonly agent_type: string;
         readonly task_source?: "agent-path-fallback" | "prepared-host-registration";
         readonly prepared_task_token?: string;
@@ -380,7 +380,9 @@ export class CodexCollabLifecycleBridge {
       tool_name: attempt.tool === "spawnAgent" ? "spawn_agent" : "followup_task",
       tool_use_id: attempt.toolUseId,
       tool_input: {
-        message: attempt.prompt,
+        ...(attempt.taskSource === "prepared-host-registration"
+          ? {}
+          : { message: attempt.prompt }),
         agent_type: attempt.agentType ?? "unknown",
         ...(attempt.taskSource !== "exact-tool-prompt"
           ? { task_source: attempt.taskSource }
