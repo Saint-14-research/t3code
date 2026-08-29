@@ -29,6 +29,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -38,8 +39,16 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
+import {
+  CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+  CodexCollabLifecycleBridge,
+  CodexCollabLifecycleDeliveryQueue,
+  type CodexCollabLifecycleHookPayload,
+  parseCodexCollabLifecycleHookArgv,
+} from "./CodexCollabLifecycleBridge.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
+import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { buildCodexDeveloperInstructions } from "../CodexDeveloperInstructions.ts";
 import {
   CODEX_PROVIDER_GUARDIAN_LOG_PREFIX,
@@ -62,6 +71,10 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
 ];
 const CODEX_APP_SERVER_FORCE_KILL_AFTER = "5 seconds" as const;
+const CODEX_COLLAB_LIFECYCLE_HOOK_TIMEOUT = "2 seconds" as const;
+const CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT = "3 seconds" as const;
+const CODEX_COLLAB_LIFECYCLE_HOOK_MAX_OUTPUT_BYTES = 8 * 1024;
+const encodeCollabLifecycleHookPayload = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -1212,6 +1225,12 @@ export const makeCodexSessionRuntime = (
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
     const collabChildMetadataRef = yield* Ref.make(new Map<string, CollabChildMetadataState>());
+    const collabLifecycleBridgeRef = yield* Ref.make<CodexCollabLifecycleBridge | undefined>(
+      undefined,
+    );
+    const collabLifecycleDeliveryQueue = new CodexCollabLifecycleDeliveryQueue();
+    const collabLifecycleFailureReportedRef = yield* Ref.make(false);
+    const collabLifecycleDeliverySemaphore = yield* Semaphore.make(1);
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
@@ -1225,6 +1244,10 @@ export const makeCodexSessionRuntime = (
       ...options.environment,
       ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
     };
+    const collabLifecycleHookArgv = parseCodexCollabLifecycleHookArgv(
+      options.environment?.[CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV] ??
+        process.env[CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV],
+    );
     const extendEnv = options.environment === undefined;
     const appServerArgs = codexSessionAppServerArgs(options.appServerArgs, options.launchArgs);
     const spawnCommand = yield* resolveSpawnCommand(options.binaryPath, appServerArgs, {
@@ -1453,6 +1476,148 @@ export const makeCodexSessionRuntime = (
         );
     });
 
+    const drainBoundedHookOutput = <E>(stream: Stream.Stream<Uint8Array, E>) =>
+      collectUint8StreamText({
+        stream,
+        maxBytes: CODEX_COLLAB_LIFECYCLE_HOOK_MAX_OUTPUT_BYTES,
+        truncatedMarker: null,
+      }).pipe(Effect.asVoid);
+
+    /**
+     * The lifecycle hook is deliberately opt-in and fail-open. Its command is
+     * a JSON argv array, passed straight to the process API with shell=false;
+     * stdout/stderr are drained only to enforce a small resource bound and are
+     * never logged or attached to provider events.
+     */
+    const invokeCollabLifecycleHook = (payload: CodexCollabLifecycleHookPayload) => {
+      if (!collabLifecycleHookArgv) {
+        return Effect.succeed(true);
+      }
+      const [command, ...args] = collabLifecycleHookArgv;
+      if (!command) {
+        return Effect.succeed(true);
+      }
+      return Effect.gen(function* () {
+        const hook = yield* spawner.spawn(
+          ChildProcess.make(command, args, {
+            cwd: options.cwd,
+            shell: false,
+          }),
+        );
+        const results = yield* Effect.all(
+          [
+            Stream.run(
+              Stream.encodeText(Stream.make(encodeCollabLifecycleHookPayload(payload))),
+              hook.stdin,
+            ),
+            drainBoundedHookOutput(hook.stdout),
+            drainBoundedHookOutput(hook.stderr),
+            hook.exitCode,
+          ],
+          { concurrency: "unbounded" },
+        );
+        return results[3] === 0;
+      }).pipe(
+        Effect.scoped,
+        Effect.timeout(CODEX_COLLAB_LIFECYCLE_HOOK_TIMEOUT),
+        Effect.orElseSucceed(() => false),
+      );
+    };
+
+    const deliverCollabLifecycleHooks = (
+      payloads: ReadonlyArray<CodexCollabLifecycleHookPayload>,
+    ) =>
+      collabLifecycleDeliverySemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          collabLifecycleDeliveryQueue.enqueue(payloads);
+          if (collabLifecycleDeliveryQueue.size === 0) {
+            return;
+          }
+          while (collabLifecycleDeliveryQueue.peek()) {
+            const pending = collabLifecycleDeliveryQueue.peek()!;
+            const delivered = yield* invokeCollabLifecycleHook(pending);
+            if (!delivered) {
+              if (!(yield* Ref.get(collabLifecycleFailureReportedRef))) {
+                yield* Ref.set(collabLifecycleFailureReportedRef, true);
+                yield* emitSessionEvent(
+                  "codex/collabLifecycleBridgeError",
+                  "Codex collaboration lifecycle recording is pending after a bounded local hook failure; the next lifecycle boundary will retry it.",
+                ).pipe(Effect.ignore);
+              }
+              return;
+            }
+            collabLifecycleDeliveryQueue.acknowledge(pending);
+          }
+          if (yield* Ref.get(collabLifecycleFailureReportedRef)) {
+            yield* Ref.set(collabLifecycleFailureReportedRef, false);
+            yield* emitSessionEvent(
+              "codex/collabLifecycleBridgeRecovered",
+              "Codex collaboration lifecycle recording caught up successfully.",
+            ).pipe(Effect.ignore);
+          }
+        }),
+      );
+
+    const observeCollabLifecycleToolCall = (notification: CodexServerNotification) =>
+      Effect.gen(function* () {
+        if (
+          (notification.method !== "item/started" && notification.method !== "item/completed") ||
+          notification.params.item.type !== "collabAgentToolCall"
+        ) {
+          return;
+        }
+        const item = notification.params.item;
+        if (
+          (item.tool !== "spawnAgent" && item.tool !== "followupTask") ||
+          typeof item.prompt !== "string" ||
+          item.prompt.length === 0
+        ) {
+          return;
+        }
+        const rootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+        if (rootThreadId !== item.senderThreadId) {
+          return;
+        }
+        const bridge =
+          (yield* Ref.get(collabLifecycleBridgeRef)) ??
+          new CodexCollabLifecycleBridge(item.senderThreadId);
+        yield* Ref.set(collabLifecycleBridgeRef, bridge);
+        const lifecyclePayloads = bridge.observeToolCall({
+          id: item.id,
+          tool: item.tool,
+          prompt: item.prompt,
+          ...(typeof item.model === "string" ? { model: item.model } : {}),
+          ...(typeof item.reasoningEffort === "string"
+            ? { reasoningEffort: item.reasoningEffort }
+            : {}),
+          receiverThreadIds: item.receiverThreadIds,
+        });
+        const exactReceiver =
+          item.receiverThreadIds.length === 1 ? item.receiverThreadIds[0] : undefined;
+        const registeredRole = exactReceiver
+          ? (yield* Ref.get(collabChildAgentsRef)).get(exactReceiver)?.role
+          : undefined;
+        yield* deliverCollabLifecycleHooks([
+          ...lifecyclePayloads,
+          ...(exactReceiver && registeredRole
+            ? bridge.observeChildRole(exactReceiver, registeredRole)
+            : []),
+        ]);
+      });
+
+    const observeCollabLifecycleTerminal = (
+      agentId: string,
+      status: "completed" | "cancelled" | "failed",
+      agentType?: string | undefined,
+    ) =>
+      Ref.get(collabLifecycleBridgeRef).pipe(
+        Effect.flatMap((bridge) =>
+          bridge
+            ? deliverCollabLifecycleHooks(bridge.observeChildTerminal(agentId, status, agentType))
+            : Effect.void,
+        ),
+      );
+
     const settlePendingApprovals = (decision: ProviderApprovalDecision) =>
       Ref.get(pendingApprovalsRef).pipe(
         Effect.flatMap((pendingApprovals) =>
@@ -1524,6 +1689,12 @@ export const makeCodexSessionRuntime = (
             return next;
           });
           const metadata = (yield* Ref.get(collabChildMetadataRef)).get(thread.id);
+          const lifecycleBridge = yield* Ref.get(collabLifecycleBridgeRef);
+          if (lifecycleBridge) {
+            yield* deliverCollabLifecycleHooks(
+              lifecycleBridge.observeChildRole(thread.id, state.role),
+            );
+          }
           yield* emitEvent({
             kind: "notification",
             threadId: options.threadId,
@@ -1681,6 +1852,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "completed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1739,6 +1911,7 @@ export const makeCodexSessionRuntime = (
               return next;
             });
             yield* markCollabChildClosed(child.agentThreadId);
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "cancelled", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1765,6 +1938,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "failed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1802,6 +1976,7 @@ export const makeCodexSessionRuntime = (
         })();
 
         rememberCollabReceiverTurns(collabReceiverTurns, notification, route.turnId);
+        yield* observeCollabLifecycleToolCall(notification);
         // Interception FIRST: a registered v2 child is usually also in the
         // receiver-turn map (collabAgentToolCall.receiverThreadIds), and the
         // legacy suppressor below would drop its lifecycle before it could
@@ -2338,6 +2513,20 @@ export const makeCodexSessionRuntime = (
       if (alreadyClosed) {
         return;
       }
+      const lifecycleBridge = yield* Ref.get(collabLifecycleBridgeRef);
+      const lifecycleChildren = yield* Ref.get(collabChildAgentsRef);
+      const closePayloads = lifecycleBridge
+        ? lifecycleBridge.observeSessionClose(
+            [...lifecycleChildren.values()].map((child) => ({
+              agentId: child.agentThreadId,
+              ...(child.role ? { agentType: child.role } : {}),
+            })),
+          )
+        : [];
+      yield* deliverCollabLifecycleHooks(closePayloads).pipe(
+        Effect.timeout(CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT),
+        Effect.ignore,
+      );
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
       const guardianExitCode = yield* child
