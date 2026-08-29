@@ -1601,8 +1601,9 @@ scopedLifecycleLayer("CodexAdapterLive scoped lifecycle", (it) => {
     }),
   );
 
-  it.effect("blocks replacement and retains ownership when close cannot be proven", () =>
+  it.effect("fails replacement but releases local ownership when close reports failure", () =>
     Effect.gen(function* () {
+      scopedLifecycleRuntimeFactory.releasedThreadIds.length = 0;
       const adapter = yield* CodexAdapter;
       const threadId = asThreadId("thread-close-failure");
       yield* adapter.startSession({
@@ -1625,8 +1626,8 @@ scopedLifecycleLayer("CodexAdapterLive scoped lifecycle", (it) => {
 
       NodeAssert.equal(failure._tag, "ProviderAdapterProcessError");
       NodeAssert.equal(scopedLifecycleRuntimeFactory.factory.mock.calls.length, runtimeCount);
-      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
-      yield* adapter.stopSession(threadId);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      NodeAssert.deepStrictEqual(scopedLifecycleRuntimeFactory.releasedThreadIds, [threadId]);
     }),
   );
 });

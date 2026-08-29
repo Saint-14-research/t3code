@@ -25,4 +25,7 @@ if (guardian.pid === undefined) throw new Error("guardian has no pid");
 process.stdout.write(`GUARDIAN_READY ${String(guardian.pid)}\n`);
 guardian.stdout.pipe(process.stdout);
 guardian.stderr.pipe(process.stderr);
+if (process.argv[4] === "--close-guardian-stdout") {
+  setTimeout(() => guardian.stdout.destroy(), 100);
+}
 setInterval(() => undefined, 1_000);

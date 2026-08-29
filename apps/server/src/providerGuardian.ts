@@ -158,10 +158,6 @@ export async function runCodexProviderGuardian(
     throw new Error("Codex child spawned without a process identifier.");
   }
 
-  NodeProcess.stdin.pipe(child.stdin);
-  child.stdout.pipe(NodeProcess.stdout, { end: false });
-  child.stderr.pipe(NodeProcess.stderr, { end: false });
-
   let childExitCode: number | null = null;
   let childExitSignal: NodeJS.Signals | null = null;
   let shutdownPromise: Promise<number> | undefined;
@@ -197,23 +193,43 @@ export async function runCodexProviderGuardian(
     return shutdownPromise;
   };
 
+  let resolveExit: ((exitCode: number) => void) | undefined;
+  const exitCodePromise = new Promise<number>((resolve) => {
+    resolveExit = resolve;
+  });
+  const requestShutdown = (reason: string) => {
+    void shutdown(reason).then(
+      (exitCode) => resolveExit?.(exitCode),
+      () => resolveExit?.(1),
+    );
+  };
+  const stopForStreamError = (name: string) => () => requestShutdown(`${name}-error`);
+
+  NodeProcess.stdin.once("error", stopForStreamError("stdin"));
+  NodeProcess.stdout.once("error", stopForStreamError("stdout"));
+  NodeProcess.stderr.once("error", stopForStreamError("stderr"));
+  child.stdin.once("error", stopForStreamError("child-stdin"));
+  child.stdout.once("error", stopForStreamError("child-stdout"));
+  child.stderr.once("error", stopForStreamError("child-stderr"));
+
+  NodeProcess.stdin.pipe(child.stdin);
+  child.stdout.pipe(NodeProcess.stdout, { end: false });
+  child.stderr.pipe(NodeProcess.stderr, { end: false });
+
   const parentCheck = setInterval(() => {
     if (NodeProcess.ppid !== spec.parentPid) void shutdown("parent-changed");
   }, 1_000);
   parentCheck.unref();
 
-  const exitCode = await new Promise<number>((resolve) => {
-    const requestShutdown = (reason: string) => {
-      void shutdown(reason).then(resolve, () => resolve(1));
-    };
-    NodeProcess.stdin.once("end", () => requestShutdown("stdin-eof"));
-    NodeProcess.once("SIGINT", () => requestShutdown("sigint"));
-    NodeProcess.once("SIGTERM", () => requestShutdown("sigterm"));
-    childExited.then(
-      () => requestShutdown("child-exit"),
-      () => requestShutdown("child-error"),
-    );
-  });
+  NodeProcess.stdin.once("end", () => requestShutdown("stdin-eof"));
+  NodeProcess.once("SIGINT", () => requestShutdown("sigint"));
+  NodeProcess.once("SIGTERM", () => requestShutdown("sigterm"));
+  childExited.then(
+    () => requestShutdown("child-exit"),
+    () => requestShutdown("child-error"),
+  );
+
+  const exitCode = await exitCodePromise;
   clearInterval(parentCheck);
   return exitCode;
 }

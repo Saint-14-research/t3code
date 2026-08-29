@@ -645,15 +645,17 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
         continue;
       }
 
-      const killed = yield* handle.kill({ killSignal: "SIGKILL", forceKillAfter: 1_000 }).pipe(
-        Effect.as(true),
-        Effect.catchCause((cause) =>
-          logBackendProcessWarning("failed to terminate unresponsive desktop backend", {
-            pid: Number(handle.pid),
-            cause: Cause.pretty(cause),
-          }).pipe(Effect.as(false)),
-        ),
-      );
+      const killed = yield* handle
+        .kill({ killSignal: "SIGTERM", forceKillAfter: DEFAULT_BACKEND_TERMINATE_GRACE })
+        .pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            logBackendProcessWarning("failed to terminate unresponsive desktop backend", {
+              pid: Number(handle.pid),
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(false)),
+          ),
+        );
       if (killed) {
         return;
       }

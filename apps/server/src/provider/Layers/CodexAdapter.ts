@@ -2006,6 +2006,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     if (session.stopped) {
       return;
     }
+    const releaseOwnership = Effect.gen(function* () {
+      session.stopped = true;
+      sessions.delete(session.threadId);
+      yield* Effect.ignore(Scope.close(session.scope, Exit.void));
+      yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+    });
     yield* session.runtime.close.pipe(
       Effect.mapError(
         (cause) =>
@@ -2016,11 +2022,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             cause,
           }),
       ),
+      Effect.ensuring(releaseOwnership),
     );
-    session.stopped = true;
-    sessions.delete(session.threadId);
-    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
@@ -2050,7 +2053,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       const results = yield* Effect.forEach(
         Array.from(sessions.keys()),
         (threadId) => stopSession(threadId).pipe(Effect.result),
-        { concurrency: 4 },
+        { concurrency: "unbounded" },
       );
       const firstFailure = results.find(Result.isFailure);
       if (firstFailure !== undefined) {

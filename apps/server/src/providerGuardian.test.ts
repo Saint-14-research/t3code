@@ -136,6 +136,43 @@ describe("Codex provider guardian", () => {
     10_000,
   );
 
+  it.runIf(NodeProcess.platform !== "win32")(
+    "kills the Codex process group when its forwarded output pipe breaks",
+    async () => {
+      const controllerEntry = NodePath.join(
+        here,
+        "provider/testFixtures/codexGuardianController.mjs",
+      );
+      const fakePeerEntry = NodePath.join(here, "provider/testFixtures/codexGuardianFakePeer.mjs");
+      const guardianEntry =
+        process.env.T3_TEST_CODEX_GUARDIAN_ENTRY ?? NodePath.join(here, "provider-guardian.ts");
+      const controller = NodeChildProcess.spawn(
+        process.execPath,
+        [controllerEntry, guardianEntry, fakePeerEntry, "--close-guardian-stdout"],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      try {
+        const lines = await waitForLines(controller.stdout, 2);
+        const guardianMarker = lines.find((line) => line.startsWith("GUARDIAN_READY "));
+        const fakeMarker = lines.find((line) => line.startsWith("FAKE_READY "));
+        expect(guardianMarker).toBeDefined();
+        expect(fakeMarker).toBeDefined();
+        const guardianPid = Number(guardianMarker?.split(" ")[1]);
+        const [, rootPidText, descendantPidText] = fakeMarker?.split(" ") ?? [];
+        const rootPid = Number(rootPidText);
+        const descendantPid = Number(descendantPidText);
+
+        await waitForExit(guardianPid);
+        await waitForExit(rootPid);
+        await waitForExit(descendantPid);
+        expect(isAlive(controller.pid!)).toBe(true);
+      } finally {
+        controller.kill("SIGKILL");
+      }
+    },
+    10_000,
+  );
+
   it.runIf(NodeProcess.platform !== "win32" && NodeFS.existsSync("/usr/bin/python3"))(
     "releases a real OS advisory writer lock after abrupt parent death",
     async () => {

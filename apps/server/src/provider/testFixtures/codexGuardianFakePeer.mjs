@@ -8,5 +8,5 @@ if (process.argv[2] === "--descendant") {
   });
   if (descendant.pid === undefined) throw new Error("descendant has no pid");
   process.stdout.write(`FAKE_READY ${String(process.pid)} ${String(descendant.pid)}\n`);
-  setInterval(() => undefined, 1_000);
+  setInterval(() => process.stdout.write("FAKE_PULSE\n"), 25);
 }

@@ -848,7 +848,62 @@ describe("DesktopBackendManager", () => {
 
         yield* TestClock.adjust(Duration.millis(30));
         assert.equal(yield* Queue.take(healthFailures), 2);
-        assert.deepEqual(killOptions, { killSignal: "SIGKILL", forceKillAfter: 1_000 });
+        assert.deepEqual(killOptions, {
+          killSignal: "SIGTERM",
+          forceKillAfter: Duration.seconds(8),
+        });
+        assert.equal((yield* Fiber.join(runFiber)).code.pipe(Option.getOrUndefined), 0);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("resets the health failure counter after a successful probe", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const childExit = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const healthFailures = yield* Queue.unbounded<number>();
+        const responseStatus = yield* Ref.make(200);
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              makeProcess({
+                exitCode: Deferred.await(childExit).pipe(
+                  Effect.as(ChildProcessSpawner.ExitCode(0)),
+                ),
+              }),
+            ),
+          ),
+        );
+        const httpLayer = httpClientLayer((request) =>
+          Ref.get(responseStatus).pipe(Effect.map((status) => responseForRequest(request, status))),
+        );
+
+        const runFiber = yield* DesktopBackendManager.runBackendProcess({
+          ...baseConfig,
+          desktopTelemetryStream: Stream.empty,
+          healthCheckInterval: Duration.millis(10),
+          healthCheckTimeout: Duration.millis(20),
+          healthCheckFailureLimit: 3,
+          onReady: () => Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+          onHealthCheckFailure: (_error, consecutiveFailures) =>
+            Queue.offer(healthFailures, consecutiveFailures).pipe(Effect.asVoid),
+        }).pipe(Effect.provide(Layer.merge(spawnerLayer, httpLayer)), Effect.forkChild);
+
+        yield* Deferred.await(ready);
+        yield* Ref.set(responseStatus, 503);
+        yield* TestClock.adjust(Duration.millis(30));
+        assert.equal(yield* Queue.take(healthFailures), 1);
+
+        yield* Ref.set(responseStatus, 200);
+        yield* TestClock.adjust(Duration.millis(10));
+        yield* Ref.set(responseStatus, 503);
+        yield* TestClock.adjust(Duration.millis(30));
+        assert.equal(yield* Queue.take(healthFailures), 1);
+
+        yield* Deferred.succeed(childExit, void 0);
         assert.equal((yield* Fiber.join(runFiber)).code.pipe(Option.getOrUndefined), 0);
       }).pipe(Effect.provide(TestClock.layer())),
     ),
