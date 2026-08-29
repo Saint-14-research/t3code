@@ -72,10 +72,9 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
 ];
 const CODEX_APP_SERVER_FORCE_KILL_AFTER = "5 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_HOOK_TIMEOUT = "2 seconds" as const;
+const CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT = "3 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_HOOK_MAX_OUTPUT_BYTES = 8 * 1024;
-const encodeCollabLifecycleHookPayload = Schema.encodeSync(
-  Schema.fromJsonString(Schema.Unknown),
-);
+const encodeCollabLifecycleHookPayload = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -1584,15 +1583,15 @@ export const makeCodexSessionRuntime = (
           new CodexCollabLifecycleBridge(item.senderThreadId);
         yield* Ref.set(collabLifecycleBridgeRef, bridge);
         const lifecyclePayloads = bridge.observeToolCall({
-            id: item.id,
-            tool: item.tool,
-            prompt: item.prompt,
-            ...(typeof item.model === "string" ? { model: item.model } : {}),
-            ...(typeof item.reasoningEffort === "string"
-              ? { reasoningEffort: item.reasoningEffort }
-              : {}),
-            receiverThreadIds: item.receiverThreadIds,
-          });
+          id: item.id,
+          tool: item.tool,
+          prompt: item.prompt,
+          ...(typeof item.model === "string" ? { model: item.model } : {}),
+          ...(typeof item.reasoningEffort === "string"
+            ? { reasoningEffort: item.reasoningEffort }
+            : {}),
+          receiverThreadIds: item.receiverThreadIds,
+        });
         const exactReceiver =
           item.receiverThreadIds.length === 1 ? item.receiverThreadIds[0] : undefined;
         const registeredRole = exactReceiver
@@ -1614,9 +1613,7 @@ export const makeCodexSessionRuntime = (
       Ref.get(collabLifecycleBridgeRef).pipe(
         Effect.flatMap((bridge) =>
           bridge
-            ? deliverCollabLifecycleHooks(
-                bridge.observeChildTerminal(agentId, status, agentType),
-              )
+            ? deliverCollabLifecycleHooks(bridge.observeChildTerminal(agentId, status, agentType))
             : Effect.void,
         ),
       );
@@ -1855,11 +1852,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "completed",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "completed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1918,11 +1911,7 @@ export const makeCodexSessionRuntime = (
               return next;
             });
             yield* markCollabChildClosed(child.agentThreadId);
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "cancelled",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "cancelled", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1949,11 +1938,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "failed",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "failed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -2528,7 +2513,20 @@ export const makeCodexSessionRuntime = (
       if (alreadyClosed) {
         return;
       }
-      yield* deliverCollabLifecycleHooks([]);
+      const lifecycleBridge = yield* Ref.get(collabLifecycleBridgeRef);
+      const lifecycleChildren = yield* Ref.get(collabChildAgentsRef);
+      const closePayloads = lifecycleBridge
+        ? lifecycleBridge.observeSessionClose(
+            [...lifecycleChildren.values()].map((child) => ({
+              agentId: child.agentThreadId,
+              ...(child.role ? { agentType: child.role } : {}),
+            })),
+          )
+        : [];
+      yield* deliverCollabLifecycleHooks(closePayloads).pipe(
+        Effect.timeout(CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT),
+        Effect.ignore,
+      );
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
       const guardianExitCode = yield* child

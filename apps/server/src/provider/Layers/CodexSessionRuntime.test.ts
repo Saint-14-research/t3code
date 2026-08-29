@@ -132,6 +132,37 @@ describe("CodexCollabLifecycleBridge", () => {
     );
     NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-a", "cancelled"), []);
   });
+
+  it("terminalizes registered active children when their session closes", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the session",
+      receiverThreadIds: ["active-child"],
+    });
+    bridge.observeChildRole("active-child", "reviewer");
+
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [
+        {
+          hook_event_name: "SubagentStop",
+          session_id: "parent-thread",
+          agent_id: "active-child",
+          agent_type: "reviewer",
+          tool_use_id: "close-tool",
+          status: "cancelled",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+      ],
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [],
+    );
+  });
 });
 
 describe("parseCodexCollabLifecycleHookArgv", () => {
@@ -144,7 +175,10 @@ describe("parseCodexCollabLifecycleHookArgv", () => {
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv("hook --unsafe"), undefined);
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv("[]"), undefined);
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv('["hook", 1]'), undefined);
-    NodeAssert.equal(CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV, "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV");
+    NodeAssert.equal(
+      CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+      "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV",
+    );
   });
 });
 
