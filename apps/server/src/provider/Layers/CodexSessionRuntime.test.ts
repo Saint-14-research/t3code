@@ -23,6 +23,7 @@ import {
   parseCodexCollabLifecycleHookArgv,
 } from "./CodexCollabLifecycleBridge.ts";
 import {
+  CodexChildTurnUsageTracker,
   buildTurnStartParams,
   describeMcpElicitation,
   hasConfiguredMcpServer,
@@ -35,6 +36,40 @@ import {
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
 describe("CodexCollabLifecycleBridge", () => {
+  it("attaches immutable exact child-turn actuals only to SubagentStop", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeNativeDispatch({
+      id: "actuals-call",
+      taskName: "measure exact child usage",
+      agentType: "mechanical",
+    });
+    bridge.observeNativeSpawn({
+      id: "actuals-call",
+      agentId: "actuals-child",
+      agentPath: "/root/measure-exact-child-usage",
+    });
+    const actuals = Object.freeze({
+      schema: "codex-child-turn-actuals-v1" as const,
+      child_thread_id: "actuals-child",
+      turn_id: "child-turn-1",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "high",
+      token_usage: Object.freeze({ input_tokens: 12, output_tokens: 5, total_tokens: 17 }),
+      token_usage_provenance: "raw-response-completed-sum-v1" as const,
+    });
+
+    const stop = bridge
+      .observeChildTerminal("actuals-child", "completed", "mechanical", actuals)
+      .find((payload) => payload.hook_event_name === "SubagentStop");
+    NodeAssert.equal(stop?.hook_event_name, "SubagentStop");
+    if (stop?.hook_event_name !== "SubagentStop") {
+      throw new Error("expected SubagentStop");
+    }
+    NodeAssert.deepStrictEqual(stop.actuals, actuals);
+    NodeAssert.ok(Object.isFrozen(stop.actuals));
+    NodeAssert.ok(Object.isFrozen(stop.actuals?.token_usage));
+  });
+
   it("records the captured native spawn boundary with explicit path-only provenance", () => {
     const bridge = new CodexCollabLifecycleBridge("parent-thread", "0.151.0");
     const payloads = [
@@ -339,6 +374,199 @@ describe("CodexCollabLifecycleBridge", () => {
     NodeAssert.equal(
       payloads[1]?.hook_event_name === "SubagentStop" ? payloads[1].status : undefined,
       "cancelled",
+    );
+  });
+});
+
+describe("CodexChildTurnUsageTracker", () => {
+  it("sums exact raw Responses completions for one fresh child turn", () => {
+    const tracker = new CodexChildTurnUsageTracker();
+    tracker.begin("child-a", "turn-a");
+    tracker.observeRawResponseCompleted({
+      agentThreadId: "child-a",
+      turnId: "turn-a",
+      responseId: "response-a-1",
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+    });
+    tracker.observeRawResponseCompleted({
+      agentThreadId: "child-a",
+      turnId: "turn-a",
+      responseId: "response-a-2",
+      usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 },
+    });
+
+    NodeAssert.deepStrictEqual(
+      tracker.complete({
+        agentThreadId: "child-a",
+        turnId: "turn-a",
+        model: "gpt-5.6-luna",
+        reasoningEffort: "high",
+      }),
+      {
+        schema: "codex-child-turn-actuals-v1",
+        child_thread_id: "child-a",
+        turn_id: "turn-a",
+        model: "gpt-5.6-luna",
+        reasoning_effort: "high",
+        token_usage: { input_tokens: 13, output_tokens: 6, total_tokens: 19 },
+        token_usage_provenance: "raw-response-completed-sum-v1",
+      },
+    );
+  });
+
+  it("isolates concurrent children by child thread and turn", () => {
+    const tracker = new CodexChildTurnUsageTracker();
+    tracker.begin("child-a", "turn-a");
+    tracker.begin("child-b", "turn-b");
+    tracker.observeRawResponseCompleted({
+      agentThreadId: "child-a",
+      turnId: "turn-a",
+      responseId: "response-a",
+      usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+    });
+    tracker.observeRawResponseCompleted({
+      agentThreadId: "child-b",
+      turnId: "turn-b",
+      responseId: "response-b",
+      usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+    });
+
+    NodeAssert.deepStrictEqual(tracker.complete({ agentThreadId: "child-a", turnId: "turn-a" }), {
+      schema: "codex-child-turn-actuals-v1",
+      child_thread_id: "child-a",
+      turn_id: "turn-a",
+      token_usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+      token_usage_provenance: "raw-response-completed-sum-v1",
+    });
+    NodeAssert.deepStrictEqual(tracker.complete({ agentThreadId: "child-b", turnId: "turn-b" }), {
+      schema: "codex-child-turn-actuals-v1",
+      child_thread_id: "child-b",
+      turn_id: "turn-b",
+      token_usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 },
+      token_usage_provenance: "raw-response-completed-sum-v1",
+    });
+  });
+
+  it("dedupes identical response delivery and fails closed for conflicting boundaries", () => {
+    const duplicate = new CodexChildTurnUsageTracker();
+    duplicate.begin("child-duplicate", "turn-duplicate");
+    duplicate.observeRawResponseCompleted({
+      agentThreadId: "child-duplicate",
+      turnId: "turn-duplicate",
+      responseId: "response-duplicate",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+    duplicate.observeRawResponseCompleted({
+      agentThreadId: "child-duplicate",
+      turnId: "turn-duplicate",
+      responseId: "response-duplicate",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+    NodeAssert.deepStrictEqual(
+      duplicate.complete({ agentThreadId: "child-duplicate", turnId: "turn-duplicate" })
+        .token_usage,
+      { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    );
+
+    const conflictingDuplicate = new CodexChildTurnUsageTracker();
+    conflictingDuplicate.begin("child-conflict", "turn-conflict");
+    conflictingDuplicate.observeRawResponseCompleted({
+      agentThreadId: "child-conflict",
+      turnId: "turn-conflict",
+      responseId: "response-conflict",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+    conflictingDuplicate.observeRawResponseCompleted({
+      agentThreadId: "child-conflict",
+      turnId: "turn-conflict",
+      responseId: "response-conflict",
+      usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+    });
+    NodeAssert.equal(
+      "token_usage" in
+        conflictingDuplicate.complete({
+          agentThreadId: "child-conflict",
+          turnId: "turn-conflict",
+        }),
+      false,
+    );
+
+    const missing = new CodexChildTurnUsageTracker();
+    missing.begin("child-missing", "turn-missing");
+    missing.observeRawResponseCompleted({
+      agentThreadId: "child-missing",
+      turnId: "turn-missing",
+      responseId: "response-missing",
+      usage: undefined,
+    });
+    NodeAssert.equal(
+      "token_usage" in missing.complete({ agentThreadId: "child-missing", turnId: "turn-missing" }),
+      false,
+    );
+
+    const invalidUsage = new CodexChildTurnUsageTracker();
+    invalidUsage.begin("child-invalid", "turn-invalid");
+    invalidUsage.observeRawResponseCompleted({
+      agentThreadId: "child-invalid",
+      turnId: "turn-invalid",
+      responseId: "response-invalid",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 3 },
+    });
+    NodeAssert.equal(
+      "token_usage" in
+        invalidUsage.complete({
+          agentThreadId: "child-invalid",
+          turnId: "turn-invalid",
+        }),
+      false,
+    );
+
+    const mismatched = new CodexChildTurnUsageTracker();
+    mismatched.begin("child-mismatch", "turn-current");
+    mismatched.observeRawResponseCompleted({
+      agentThreadId: "child-mismatch",
+      turnId: "turn-other",
+      responseId: "response-mismatch",
+      usage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+    });
+    NodeAssert.equal(
+      "token_usage" in
+        mismatched.complete({
+          agentThreadId: "child-mismatch",
+          turnId: "turn-current",
+        }),
+      false,
+    );
+
+    const completionMismatch = new CodexChildTurnUsageTracker();
+    completionMismatch.begin("child-completion-mismatch", "turn-current");
+    completionMismatch.observeRawResponseCompleted({
+      agentThreadId: "child-completion-mismatch",
+      turnId: "turn-current",
+      responseId: "response-current",
+      usage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+    });
+    NodeAssert.equal(
+      "token_usage" in
+        completionMismatch.complete({
+          agentThreadId: "child-completion-mismatch",
+          turnId: "turn-other",
+        }),
+      false,
+    );
+
+    const overlap = new CodexChildTurnUsageTracker();
+    overlap.begin("child-overlap", "turn-first");
+    overlap.begin("child-overlap", "turn-second");
+    overlap.observeRawResponseCompleted({
+      agentThreadId: "child-overlap",
+      turnId: "turn-second",
+      responseId: "response-overlap",
+      usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+    });
+    NodeAssert.equal(
+      "token_usage" in overlap.complete({ agentThreadId: "child-overlap", turnId: "turn-second" }),
+      false,
     );
   });
 });

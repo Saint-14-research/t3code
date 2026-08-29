@@ -135,6 +135,7 @@ describe("routeCodexChildNotification", () => {
       "item/agentMessage/delta",
       "item/reasoning/textDelta",
       "item/commandExecution/outputDelta",
+      "rawResponse/completed",
       "turn/plan/updated",
       "thread/name/updated",
     ]) {
