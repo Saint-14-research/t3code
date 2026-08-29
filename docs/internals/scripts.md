@@ -64,6 +64,26 @@ authenticated.
 - `node apps/server/scripts/t3-sqlite-state.ts <query|exec> --base-dir <path> ...`: Inspects or seeds
   an isolated T3 SQLite database; writes create a private backup first.
 
+### Codex collaboration lifecycle bridge
+
+`T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV` optionally connects native Codex
+`spawnAgent` and `followupTask` events to a local lifecycle recorder. Its value is
+a JSON array containing the executable and literal arguments, for example:
+
+```bash
+T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV='["/usr/bin/python3","-B","/absolute/path/to/capture-delegation-lifecycle.py"]' vp run dev:server
+```
+
+T3 executes the array without a shell and sends one JSON payload on stdin. The
+bridge is fail-open, limits each invocation to two seconds and 8 KiB of drained
+output, and does not log task or result content. Failed deliveries remain ordered
+in session memory, retry only at the next lifecycle boundary and session close,
+and emit bounded failure and recovery session events. An unset or invalid value
+disables the bridge. Configuring
+the variable proves only activation intent; the recorder's
+exact bridge-lifecycle runtime receipt is the functional evidence. Provider-version
+attribution remains explicitly unbound.
+
 ## Desktop artifacts
 
 - `vp run dist:desktop:artifact --platform <mac|linux|win> --target <target> --arch <arch>`: Builds a desktop artifact for a specific platform/target/arch.
