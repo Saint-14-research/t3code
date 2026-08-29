@@ -226,6 +226,7 @@ const publishCmd = Command.make(
       for (const relPath of [
         "dist/bin.mjs",
         "dist/service-launcher.mjs",
+        "dist/provider-guardian.mjs",
         "dist/client/index.html",
       ]) {
         const abs = path.join(serverDir, relPath);

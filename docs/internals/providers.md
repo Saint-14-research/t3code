@@ -39,6 +39,23 @@ directory to route session and turn operations for a thread, so callers name a t
 Adding a driver means writing the driver plus adapter and adding it to `BUILT_IN_DRIVERS`. No
 orchestration, contract, or client change is required for the common case.
 
+## Codex process ownership
+
+On macOS and Linux, each Codex session runs `codex app-server` behind the bundled
+`provider-guardian.mjs`. T3 owns the guardian's stdio, and the guardian owns Codex in a dedicated
+process group. stdin EOF, guardian termination, or loss of the recorded T3 parent enters one
+idempotent cleanup path: terminate the exact group, escalate after the bounded grace period, and
+wait for it to disappear. T3 does not replace the adapter session until guardian exit is observed.
+
+This boundary is required because Codex protects each thread with an OS advisory single-writer lock
+but its stdio app-server has no reattach protocol. A server restart must therefore finish the old
+process tree before resuming the thread. T3 never deletes Codex lock files or signals a process it
+does not own. An exact JSON-RPC `-32600` active-writer response is reported as a foreign writer and
+does not fall back to creating a fresh Codex thread.
+
+The guardian remains disabled on Windows until the real `codex.cmd` grandchild tree can be contained
+and kill-tested with a PID-scoped OS primitive such as a Job Object.
+
 ## Model manifest
 
 The model picker's legacy section is driven by `apps/server/src/provider/model-manifest.json`, which

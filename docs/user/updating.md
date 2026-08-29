@@ -15,8 +15,10 @@ update the server, and the version difference remains visible in Connections.
 
 ## Before You Update
 
-Let active agent work and terminal commands finish first. Updating restarts the server, so the
-connection will disappear briefly and work that is still running may be interrupted.
+Let active agent work and terminal commands finish first. A background-service update refuses to
+restart while an agent turn or native background workload is active and tells you to retry after it
+settles. Desktop-app and manual updates still require you to finish active work first. Updating
+restarts the server, so the connection will disappear briefly.
 
 The update does not remove saved threads, settings, or project files.
 

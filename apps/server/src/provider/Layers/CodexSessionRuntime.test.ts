@@ -19,6 +19,7 @@ import {
   buildTurnStartParams,
   describeMcpElicitation,
   hasConfiguredMcpServer,
+  isCodexActiveWriterError,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
   openCodexThread,
@@ -752,6 +753,33 @@ describe("isRecoverableThreadResumeError", () => {
     );
   });
 
+  it("classifies active writer only from the exact code and phrase", () => {
+    const exact = new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage: "thread 019f already has an active writer",
+    });
+    NodeAssert.equal(isCodexActiveWriterError(exact), true);
+    NodeAssert.equal(isRecoverableThreadResumeError(exact), false);
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32600,
+          errorMessage: "Invalid request",
+        }),
+      ),
+      false,
+    );
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "thread 019f already has an active writer",
+        }),
+      ),
+      false,
+    );
+  });
+
   it("ignores unrelated missing-resource errors that do not mention threads", () => {
     NodeAssert.equal(
       isRecoverableThreadResumeError(
@@ -848,6 +876,39 @@ describe("openCodexThread", () => {
 
       NodeAssert.ok(isCodexAppServerRequestError(error));
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
+    }),
+  );
+
+  it.effect("never falls back to a new thread when the existing thread has a writer", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const client = {
+        request: <M extends "thread/start" | "thread/resume">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.fail(
+            new CodexErrors.CodexAppServerRequestError({
+              code: -32600,
+              errorMessage: "thread provider-thread-1 already has an active writer",
+            }),
+          );
+        },
+      };
+
+      const error = yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.3-codex",
+        serviceTier: undefined,
+        resumeThreadId: "provider-thread-1",
+      }).pipe(Effect.flip);
+
+      NodeAssert.equal(isCodexActiveWriterError(error), true);
+      NodeAssert.deepStrictEqual(calls, ["thread/resume"]);
     }),
   );
 });

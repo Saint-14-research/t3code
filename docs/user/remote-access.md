@@ -174,8 +174,10 @@ the conversation and in **Settings** → **Connections**. Follow the action show
 be able to update and reconnect the server for you, or it may ask you to update the desktop app or
 run a copied command on the server machine.
 
-Finish active work before updating because the server restarts briefly. For step-by-step guidance,
-see [Keeping T3 Code in Sync](./updating.md).
+The background-service update action refuses to restart while an agent turn or native background
+work is active. Finish or stop that work and retry if T3 Code pauses the update. For desktop-app or
+manual updates, finish active work before updating because the server restarts briefly. For
+step-by-step guidance, see [Keeping T3 Code in Sync](./updating.md).
 
 On a Linux host, you can keep the server running after logout and manage it independently of the
 connection method. See [Running T3 Code in the Background](./background-service.md).
