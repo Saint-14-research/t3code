@@ -82,7 +82,9 @@ and emit bounded failure and recovery session events. An unset or invalid value
 disables the bridge. Configuring
 the variable proves only activation intent; the recorder's
 exact bridge-lifecycle runtime receipt is the functional evidence. Provider-version
-attribution remains explicitly unbound.
+attribution is bound only when matching `SubagentStart` and `SubagentStop` events
+carry the normalized version reported by that session's app-server `initialize`
+response; the lifecycle hook does not infer it from a separate executable on `PATH`.
 
 ## Desktop artifacts
 

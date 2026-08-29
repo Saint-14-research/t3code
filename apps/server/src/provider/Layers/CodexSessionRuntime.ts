@@ -39,7 +39,7 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
-import { buildCodexInitializeParams } from "./CodexProvider.ts";
+import { buildCodexInitializeParams, parseCodexAppServerVersion } from "./CodexProvider.ts";
 import {
   CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
   CodexCollabLifecycleBridge,
@@ -1239,6 +1239,7 @@ export const makeCodexSessionRuntime = (
     const collabLifecycleBridgeRef = yield* Ref.make<CodexCollabLifecycleBridge | undefined>(
       undefined,
     );
+    const codexAppServerVersionRef = yield* Ref.make<string | undefined>(undefined);
     const collabLifecycleDeliveryQueue = new CodexCollabLifecycleDeliveryQueue();
     const collabLifecycleFailureReportedRef = yield* Ref.make(false);
     const collabLifecycleDeliverySemaphore = yield* Semaphore.make(1);
@@ -1591,7 +1592,10 @@ export const makeCodexSessionRuntime = (
         }
         const bridge =
           (yield* Ref.get(collabLifecycleBridgeRef)) ??
-          new CodexCollabLifecycleBridge(item.senderThreadId);
+          new CodexCollabLifecycleBridge(
+            item.senderThreadId,
+            yield* Ref.get(codexAppServerVersionRef),
+          );
         yield* Ref.set(collabLifecycleBridgeRef, bridge);
         const lifecyclePayloads = bridge.observeToolCall({
           id: item.id,
@@ -1640,7 +1644,7 @@ export const makeCodexSessionRuntime = (
         }
         const bridge =
           (yield* Ref.get(collabLifecycleBridgeRef)) ??
-          new CodexCollabLifecycleBridge(rootThreadId);
+          new CodexCollabLifecycleBridge(rootThreadId, yield* Ref.get(codexAppServerVersionRef));
         yield* Ref.set(collabLifecycleBridgeRef, bridge);
         yield* deliverCollabLifecycleHooks(
           bridge.observeNativeDispatch({
@@ -1808,7 +1812,10 @@ export const makeCodexSessionRuntime = (
           if (item.kind === "started" && rootProviderThreadId) {
             const bridge =
               (yield* Ref.get(collabLifecycleBridgeRef)) ??
-              new CodexCollabLifecycleBridge(rootProviderThreadId);
+              new CodexCollabLifecycleBridge(
+                rootProviderThreadId,
+                yield* Ref.get(codexAppServerVersionRef),
+              );
             yield* Ref.set(collabLifecycleBridgeRef, bridge);
             yield* deliverCollabLifecycleHooks([
               ...bridge.observeNativeSpawn({
@@ -2532,7 +2539,8 @@ export const makeCodexSessionRuntime = (
 
     const start = Effect.fn("CodexSessionRuntime.start")(function* () {
       yield* emitSessionEvent("session/connecting", "Starting Codex App Server session.");
-      yield* client.request("initialize", buildCodexInitializeParams());
+      const initialize = yield* client.request("initialize", buildCodexInitializeParams());
+      yield* Ref.set(codexAppServerVersionRef, parseCodexAppServerVersion(initialize.userAgent));
       yield* client.notify("initialized", undefined);
 
       const requestedModel = normalizeCodexModelSlug(options.model);
