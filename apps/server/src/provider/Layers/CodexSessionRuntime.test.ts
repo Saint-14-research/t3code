@@ -163,6 +163,30 @@ describe("CodexCollabLifecycleBridge", () => {
       [],
     );
   });
+
+  it("terminalizes a bound child when the session closes before child registration", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "early-close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the startup window",
+      receiverThreadIds: ["unregistered-child"],
+    });
+
+    const payloads = bridge.observeSessionClose([]);
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      payloads[0]?.hook_event_name === "SubagentStart" ? payloads[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStop" ? payloads[1].status : undefined,
+      "cancelled",
+    );
+  });
 });
 
 describe("parseCodexCollabLifecycleHookArgv", () => {

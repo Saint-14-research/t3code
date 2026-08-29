@@ -159,8 +159,9 @@ export class CodexCollabLifecycleBridge {
       readonly agentType?: string | undefined;
     }>,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
-    return children.flatMap((child) =>
-      this.observeChildTerminal(child.agentId, "cancelled", child.agentType),
+    const agentTypes = new Map(children.map((child) => [child.agentId, child.agentType]));
+    return [...this.#attemptsByAgentId.keys()].flatMap((agentId) =>
+      this.observeChildTerminal(agentId, "cancelled", agentTypes.get(agentId)),
     );
   }
 
