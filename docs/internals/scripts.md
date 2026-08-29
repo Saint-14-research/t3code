@@ -64,6 +64,26 @@ authenticated.
 - `node apps/server/scripts/t3-sqlite-state.ts <query|exec> --base-dir <path> ...`: Inspects or seeds
   an isolated T3 SQLite database; writes create a private backup first.
 
+### Codex collaboration lifecycle bridge
+
+`T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV` optionally connects native Codex
+`spawnAgent` and `followupTask` events to a local lifecycle recorder. Its value is
+a JSON array containing the executable and literal arguments, for example:
+
+```bash
+T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV='["/usr/bin/python3","-B","/absolute/path/to/capture-delegation-lifecycle.py"]' vp run dev:server
+```
+
+T3 executes the array without a shell and sends one JSON payload on stdin. The
+bridge is fail-open, limits each invocation to two seconds and 8 KiB of drained
+output, and does not log task or result content. Failed deliveries remain ordered
+in session memory, retry only at the next lifecycle boundary and session close,
+and emit bounded failure and recovery session events. An unset or invalid value
+disables the bridge. Configuring
+the variable proves only activation intent; the recorder's
+exact bridge-lifecycle runtime receipt is the functional evidence. Provider-version
+attribution remains explicitly unbound.
+
 ## Desktop artifacts
 
 - `vp run dist:desktop:artifact --platform <mac|linux|win> --target <target> --arch <arch>`: Builds a desktop artifact for a specific platform/target/arch.
@@ -78,6 +98,11 @@ authenticated.
 
 - Default build is unsigned/not notarized for local sharing.
 - The DMG build uses `assets/prod/black-macos-1024.png` as the production app icon source.
+- The DMG chrome follows the release channel: neutral for Latest and the Nightly sky artwork for
+  Nightly. Blueprint artwork remains exclusive to Dev builds. Packaging rasterizes the selected
+  SVG into standard and Retina PNGs inside the disposable staging directory.
+- The Finder window is 540×412 while its background is 540×380; the extra 32px accounts for the
+  title bar included in Finder's window bounds.
 - Desktop production windows load the bundled UI from the `t3code://app/` root URL (not a
   `127.0.0.1` document URL, and not an explicit `index.html` path).
 - Desktop packaging includes `apps/server/dist` (the `t3` backend) and starts it on loopback with an

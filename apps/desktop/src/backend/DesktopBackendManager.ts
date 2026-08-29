@@ -52,6 +52,7 @@ import { waitForHttpReady as waitForHttpReadyShared } from "@t3tools/shared/http
 
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
+import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
 
 const INITIAL_RESTART_DELAY = Duration.millis(500);
 const MAX_RESTART_DELAY = Duration.seconds(10);
@@ -63,7 +64,10 @@ const MAX_PREFLIGHT_FAILURE_ATTEMPTS = 5;
 const DEFAULT_BACKEND_READINESS_TIMEOUT = Duration.minutes(1);
 const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
-const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(2);
+const DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL = Duration.seconds(5);
+const DEFAULT_BACKEND_HEALTH_CHECK_TIMEOUT = Duration.seconds(2);
+const DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_LIMIT = 3;
+const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(8);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
 const { logWarning: logBackendProcessWarning } =
@@ -99,6 +103,10 @@ export interface DesktopBackendStartConfig extends BackendProcessContext {
   // Present for a WSL run after the configured/default distro has been
   // resolved to the concrete distro passed to wsl.exe.
   readonly runningDistro?: string;
+  // Present only when this run launched from a staged WSL-local runtime.
+  // Once HTTP readiness succeeds, the manager uses it to retain this cache
+  // plus the newest previous cache and prune older versions.
+  readonly wslRuntimeId?: string;
 }
 
 // A preflight failure records whether it is fatal. Transient failures (WSL
@@ -221,11 +229,19 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
   readonly readinessTimeout?: Duration.Duration;
+  readonly healthCheckInterval?: Duration.Duration;
+  readonly healthCheckTimeout?: Duration.Duration;
+  readonly healthCheckFailureLimit?: number;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
   readonly onExitObserved?: () => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
   readonly onReadinessFailure?: (error: BackendReadinessTimeoutError) => Effect.Effect<void>;
+  readonly onHealthCheckFailure?: (
+    error: BackendReadinessTimeoutError,
+    consecutiveFailures: number,
+    failureLimit: number,
+  ) => Effect.Effect<void>;
   readonly onOutput?: (
     streamName: BackendProcessOutputStream,
     chunk: Uint8Array,
@@ -563,19 +579,88 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
       ).pipe(Effect.forkScoped),
     );
   }
-  yield* waitForHttpReady({
-    executablePath: options.executablePath,
-    entryPath: options.entryPath,
-    cwd: options.cwd,
-    httpBaseUrl: options.httpBaseUrl,
-    timeout: options.readinessTimeout ?? DEFAULT_BACKEND_READINESS_TIMEOUT,
-  }).pipe(
-    Effect.tap(() => options.onReady?.() ?? Effect.void),
-    Effect.catchTags({
-      BackendReadinessTimeoutError: (error) => options.onReadinessFailure?.(error) ?? Effect.void,
-    }),
-    Effect.forkScoped,
+  // Probe readiness in a loop while the backend process is still alive
+  // instead of giving up after the first budget. A slow cold boot (the
+  // WSL bundle loading across /mnt/c, or a first launch right after an
+  // update) can exceed the initial readiness budget while the backend is
+  // about to come up moments later; a one-shot probe left the app stuck
+  // on "Connecting to WSL…" forever even though the backend kept running
+  // and became healthy. Each round gets a fresh budget, and the forked
+  // loop is torn down with the run scope once the child exits.
+  const probeReadiness = Effect.fn("desktop.backendProcess.probeReadiness")(() =>
+    waitForHttpReady({
+      executablePath: options.executablePath,
+      entryPath: options.entryPath,
+      cwd: options.cwd,
+      httpBaseUrl: options.httpBaseUrl,
+      timeout: options.readinessTimeout ?? DEFAULT_BACKEND_READINESS_TIMEOUT,
+    }).pipe(
+      Effect.flatMap(() => options.onReady?.() ?? Effect.void),
+      Effect.as(true),
+      Effect.catchTags({
+        BackendReadinessTimeoutError: (error) =>
+          (options.onReadinessFailure?.(error) ?? Effect.void).pipe(Effect.as(false)),
+      }),
+    ),
   );
+
+  yield* Effect.gen(function* () {
+    yield* probeReadiness().pipe(Effect.repeat({ while: (ready) => !ready }));
+
+    const healthCheckInterval =
+      options.healthCheckInterval ?? DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL;
+    const healthCheckTimeout = options.healthCheckTimeout ?? DEFAULT_BACKEND_HEALTH_CHECK_TIMEOUT;
+    const failureLimit = Math.max(
+      1,
+      Math.floor(options.healthCheckFailureLimit ?? DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_LIMIT),
+    );
+    let consecutiveFailures = 0;
+
+    while (true) {
+      yield* Effect.sleep(healthCheckInterval);
+      const result = yield* waitForHttpReady({
+        executablePath: options.executablePath,
+        entryPath: options.entryPath,
+        cwd: options.cwd,
+        httpBaseUrl: options.httpBaseUrl,
+        timeout: healthCheckTimeout,
+      }).pipe(
+        Effect.as({ healthy: true } as const),
+        Effect.catchTag("BackendReadinessTimeoutError", (error) =>
+          Effect.succeed({ healthy: false, error } as const),
+        ),
+      );
+
+      if (result.healthy) {
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      consecutiveFailures += 1;
+      yield* (
+        options.onHealthCheckFailure?.(result.error, consecutiveFailures, failureLimit) ??
+          Effect.void
+      );
+      if (consecutiveFailures < failureLimit) {
+        continue;
+      }
+
+      const killed = yield* handle
+        .kill({ killSignal: "SIGTERM", forceKillAfter: DEFAULT_BACKEND_TERMINATE_GRACE })
+        .pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            logBackendProcessWarning("failed to terminate unresponsive desktop backend", {
+              pid: Number(handle.pid),
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(false)),
+          ),
+        );
+      if (killed) {
+        return;
+      }
+    }
+  }).pipe(Effect.forkScoped);
 
   const exit = yield* handle.exitCode.pipe(
     Effect.mapError(
@@ -624,6 +709,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   | HttpClient.HttpClient
   | DesktopObservability.DesktopBackendOutputLogFactory
   | DesktopTelemetryPublisher.DesktopTelemetryPublisher
+  | DesktopWslEnvironment.DesktopWslEnvironment
   | Scope.Scope
 > {
   const parentScope = yield* Scope.Scope;
@@ -631,6 +717,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   const backendOutputLogFactory = yield* DesktopObservability.DesktopBackendOutputLogFactory;
   const backendOutputLog = yield* backendOutputLogFactory.forInstance(spec.id);
   const desktopTelemetryPublisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+  const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const httpClient = yield* HttpClient.HttpClient;
   const state = yield* Ref.make(initialState);
@@ -926,6 +1013,15 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             }
 
             yield* spec.onReady?.(config.value.httpBaseUrl) ?? Effect.void;
+            if (
+              config.value.runningDistro !== undefined &&
+              config.value.wslRuntimeId !== undefined
+            ) {
+              yield* wslEnvironment.pruneRuntimes(
+                config.value.runningDistro,
+                config.value.wslRuntimeId,
+              );
+            }
           }),
           onReadinessFailure: Effect.fn("desktop.backendInstance.onReadinessFailure")(
             function* (error) {
@@ -935,6 +1031,20 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               yield* backendOutputLog.persistFailureSnapshot({
                 details: error.message,
               });
+            },
+          ),
+          onHealthCheckFailure: Effect.fn("desktop.backendInstance.onHealthCheckFailure")(
+            function* (error, consecutiveFailures, failureLimit) {
+              yield* logInstanceWarning("backend health check failed after readiness", {
+                error: error.message,
+                consecutiveFailures,
+                failureLimit,
+              });
+              if (consecutiveFailures === failureLimit) {
+                yield* backendOutputLog.persistFailureSnapshot({
+                  details: `${error.message} consecutiveFailures=${consecutiveFailures} failureLimit=${failureLimit}`,
+                });
+              }
             },
           ),
           onOutput: (streamName, chunk) => backendOutputLog.writeOutputChunk(streamName, chunk),

@@ -15,8 +15,10 @@ update the server, and the version difference remains visible in Connections.
 
 ## Before You Update
 
-Let active agent work and terminal commands finish first. Updating restarts the server, so the
-connection will disappear briefly and work that is still running may be interrupted.
+Let active agent work and terminal commands finish first. A background-service update refuses to
+restart while an agent turn or native background workload is active and tells you to retry after it
+settles. Desktop-app and manual updates still require you to finish active work first. Updating
+restarts the server, so the connection will disappear briefly.
 
 The update does not remove saved threads, settings, or project files.
 
@@ -69,5 +71,13 @@ If a step fails:
 2. Make sure you updated the machine named in the warning, not only the device you are using.
 3. For a command-line server, relaunch it with `npx t3@<client-version>`, replacing
    `<client-version>` with the client version shown in the warning.
+
+## The Mobile App
+
+The mobile app keeps itself current on its own. When it finds a new version, it downloads it in the
+background and installs it automatically the next time you leave the app. Unsent drafts and queued
+messages are saved before the restart. Only if the app stays open long enough that the update never
+gets that chance does it ask whether to install right away; choosing **Later** is safe and keeps the
+automatic install armed.
 
 For remote connection setup and access troubleshooting, see [Remote Access](./remote-access.md).

@@ -7,20 +7,359 @@ import { describe } from "vite-plus/test";
 import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
+import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import {
   buildCodexDeveloperInstructions,
-  CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
-  CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+  codexDefaultModeDeveloperInstructions,
+  codexPlanModeDeveloperInstructions,
 } from "../CodexDeveloperInstructions.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
+  CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+  CodexCollabLifecycleBridge,
+  CodexCollabLifecycleDeliveryQueue,
+  parseCodexCollabLifecycleHookArgv,
+} from "./CodexCollabLifecycleBridge.ts";
+import {
   buildTurnStartParams,
+  describeMcpElicitation,
   hasConfiguredMcpServer,
+  isCodexActiveWriterError,
   isRecoverableThreadResumeError,
+  makeMemoryConsolidationNotificationFilter,
   openCodexThread,
+  toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
+
+describe("CodexCollabLifecycleBridge", () => {
+  it("records the captured native spawn boundary with explicit path-only provenance", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const payloads = [
+      ...bridge.observeNativeDispatch({
+        id: "call-native-spawn",
+        taskName: "native_lifecycle_canary",
+        agentType: "mechanical",
+      }),
+      ...bridge.observeNativeSpawn({
+        id: "call-native-spawn",
+        agentId: "child-native",
+        agentPath: "/root/native_lifecycle_canary",
+      }),
+      ...bridge.observeChildRole("child-native", "mechanical"),
+    ];
+
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["PreToolUse", "SubagentStart"],
+    );
+    NodeAssert.deepStrictEqual(
+      payloads[0]?.hook_event_name === "PreToolUse" ? payloads[0].tool_input : undefined,
+      {
+        message: "Codex delegated task name: native_lifecycle_canary",
+        agent_type: "mechanical",
+        task_source: "agent-path-fallback",
+      },
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStart" ? payloads[1].tool_use_id : undefined,
+      "call-native-spawn",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStart" ? payloads[1].agent_type : undefined,
+      "mechanical",
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeNativeSpawn({
+        id: "call-native-spawn",
+        agentId: "child-native",
+        agentPath: "/root/native_lifecycle_canary",
+      }),
+      [],
+    );
+  });
+
+  it("emits the native hook lifecycle once for one causally bound child", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const dispatched = bridge.observeToolCall({
+      id: "tool-call-1",
+      tool: "spawnAgent",
+      prompt: "Investigate the regression",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      receiverThreadIds: ["child-thread-1"],
+    });
+
+    NodeAssert.deepStrictEqual(dispatched, [
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "parent-thread",
+        tool_name: "spawn_agent",
+        tool_use_id: "tool-call-1",
+        tool_input: {
+          message: "Investigate the regression",
+          agent_type: "unknown",
+          model: "gpt-5.4",
+          reasoning_effort: "high",
+        },
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+    NodeAssert.deepStrictEqual(bridge.observeChildRole("child-thread-1", "reviewer"), [
+      {
+        hook_event_name: "SubagentStart",
+        session_id: "parent-thread",
+        agent_id: "child-thread-1",
+        agent_type: "reviewer",
+        tool_use_id: "tool-call-1",
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-1", "completed"), [
+      {
+        hook_event_name: "SubagentStop",
+        session_id: "parent-thread",
+        agent_id: "child-thread-1",
+        agent_type: "reviewer",
+        tool_use_id: "tool-call-1",
+        status: "completed",
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-1", "completed"), []);
+  });
+
+  it("buffers a child terminal until one tool call has exactly one receiver", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const initial = {
+      id: "tool-call-2",
+      tool: "followupTask" as const,
+      prompt: "Run the narrow test",
+      receiverThreadIds: [],
+    };
+
+    NodeAssert.equal(bridge.observeToolCall(initial)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-2", "failed"), []);
+    const bound = bridge.observeToolCall({ ...initial, receiverThreadIds: ["child-thread-2"] });
+
+    NodeAssert.deepStrictEqual(
+      bound.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "tool-call-2",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].tool_use_id : undefined,
+      "tool-call-2",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
+      "failed",
+    );
+  });
+
+  it("does not bind a multi-receiver call to an arbitrary child", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const payloads = bridge.observeToolCall({
+      id: "tool-call-3",
+      tool: "spawnAgent",
+      prompt: "Fan out",
+      receiverThreadIds: ["child-a", "child-b"],
+    });
+
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["PreToolUse"],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-a", "cancelled"), []);
+  });
+
+  it("binds a reused child's late followup terminal to the new attempt", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "initial-tool",
+      tool: "spawnAgent",
+      prompt: "Run the first task",
+      receiverThreadIds: ["reused-child"],
+    });
+    bridge.observeChildRole("reused-child", "reviewer");
+    bridge.observeChildTerminal("reused-child", "completed");
+
+    const followup = {
+      id: "followup-tool",
+      tool: "followupTask" as const,
+      prompt: "Run the followup",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(followup)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(bridge.observeChildRole("reused-child", "reviewer"), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeChildTerminal("reused-child", "completed", "reviewer"),
+      [],
+    );
+
+    const bound = bridge.observeToolCall({
+      ...followup,
+      receiverThreadIds: ["reused-child"],
+      status: "completed",
+    });
+    NodeAssert.deepStrictEqual(
+      bound.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "followup-tool",
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
+      "reviewer",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
+      "completed",
+    );
+  });
+
+  it("retires an unbound failed tool call and closes its session once", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const call = {
+      id: "failed-tool",
+      tool: "spawnAgent" as const,
+      prompt: "Try to spawn",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(call)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(
+      bridge.observeToolCall({ ...call, status: "failed" }).map((payload) => ({
+        event: payload.hook_event_name,
+        toolUseId: "tool_use_id" in payload ? payload.tool_use_id : undefined,
+      })),
+      [{ event: "PostToolUseFailure", toolUseId: "failed-tool" }],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeToolCall({ ...call, status: "failed" }), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([]).map((payload) => payload.hook_event_name),
+      ["SessionEnd"],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeSessionClose([]), []);
+  });
+
+  it("terminalizes registered active children when their session closes", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the session",
+      receiverThreadIds: ["active-child"],
+    });
+    bridge.observeChildRole("active-child", "reviewer");
+
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [
+        {
+          hook_event_name: "SubagentStop",
+          session_id: "parent-thread",
+          agent_id: "active-child",
+          agent_type: "reviewer",
+          tool_use_id: "close-tool",
+          status: "cancelled",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+        {
+          hook_event_name: "SessionEnd",
+          session_id: "parent-thread",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+      ],
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [],
+    );
+  });
+
+  it("terminalizes a bound child when the session closes before child registration", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "early-close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the startup window",
+      receiverThreadIds: ["unregistered-child"],
+    });
+
+    const payloads = bridge.observeSessionClose([]);
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop", "SessionEnd"],
+    );
+    NodeAssert.equal(
+      payloads[0]?.hook_event_name === "SubagentStart" ? payloads[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStop" ? payloads[1].status : undefined,
+      "cancelled",
+    );
+  });
+});
+
+describe("parseCodexCollabLifecycleHookArgv", () => {
+  it("accepts only a non-empty JSON argv array", () => {
+    NodeAssert.deepStrictEqual(
+      parseCodexCollabLifecycleHookArgv('["/usr/bin/python3", "-B", "/tmp/hook.py"]'),
+      ["/usr/bin/python3", "-B", "/tmp/hook.py"],
+    );
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv(undefined), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv("hook --unsafe"), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv("[]"), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv('["hook", 1]'), undefined);
+    NodeAssert.equal(
+      CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+      "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV",
+    );
+  });
+});
+
+describe("CodexCollabLifecycleDeliveryQueue", () => {
+  it("retains an unacknowledged hook and replays it before later events", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const queue = new CodexCollabLifecycleDeliveryQueue();
+    const preToolUse = bridge.observeToolCall({
+      id: "retry-tool",
+      tool: "spawnAgent",
+      prompt: "Bounded task",
+      receiverThreadIds: ["retry-child"],
+    });
+    const start = bridge.observeChildRole("retry-child", "worker");
+    queue.enqueue([...preToolUse, ...start]);
+
+    const failedDelivery = queue.peek();
+    NodeAssert.equal(failedDelivery?.hook_event_name, "PreToolUse");
+    NodeAssert.equal(queue.peek(), failedDelivery);
+    NodeAssert.equal(queue.size, 2);
+
+    queue.acknowledge(failedDelivery!);
+    NodeAssert.equal(queue.peek()?.hook_event_name, "SubagentStart");
+    NodeAssert.equal(queue.size, 1);
+  });
+});
 
 describe("CodexSessionRuntimeIdentifierGenerationError", () => {
   it("retains identifier purpose and the random source failure", () => {
@@ -246,6 +585,208 @@ describe("buildTurnStartParams", () => {
   });
 });
 
+describe("Codex MCP elicitation approvals", () => {
+  const request = {
+    mode: "form",
+    message: "Allow ChatGPT to use Safari?",
+    serverName: "computer-use",
+    threadId: "provider-thread-1",
+    turnId: "turn-1",
+    _meta: {
+      app_name: "Safari",
+      persist: ["session", "always"],
+    },
+    requestedSchema: {
+      type: "object",
+      properties: {
+        approval: {
+          type: "string",
+          oneOf: [
+            { const: "once", title: "Allow once" },
+            { const: "session", title: "Allow for this session" },
+            { const: "always", title: "Always allow Safari" },
+          ],
+        },
+      },
+      required: ["approval"],
+    },
+  } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+  it("preserves the app name and advertised persistence choices", () => {
+    NodeAssert.deepStrictEqual(describeMcpElicitation(request), {
+      appName: "Safari",
+      options: [
+        { decision: "cancel", label: "Cancel" },
+        { decision: "decline", label: "Decline" },
+        { decision: "acceptForSession", label: "Allow for this session" },
+        { decision: "acceptAlways", label: "Always allow Safari" },
+        { decision: "accept", label: "Approve" },
+      ],
+    });
+  });
+
+  it("extracts the app name from a Computer Use request without metadata", () => {
+    const { _meta, ...requestWithoutMetadata } = request;
+
+    NodeAssert.equal(describeMcpElicitation(requestWithoutMetadata).appName, "Safari");
+  });
+
+  it("returns the accepted form option to Codex", () => {
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(request, "accept"), {
+      action: "accept",
+      content: { approval: "once" },
+    });
+  });
+
+  it("returns session-scoped approval in the MCP response", () => {
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(request, "acceptForSession"), {
+      action: "accept",
+      _meta: { persist: "session" },
+      content: { approval: "session" },
+    });
+  });
+
+  it("returns persistent approval in the MCP response", () => {
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(request, "acceptAlways"), {
+      action: "accept",
+      _meta: { persist: "always" },
+      content: { approval: "always" },
+    });
+  });
+
+  it("returns rejection without form content", () => {
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(request, "decline"), {
+      action: "decline",
+    });
+  });
+
+  it("returns cancellation without form content", () => {
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(request, "cancel"), {
+      action: "cancel",
+    });
+  });
+
+  it("supports boolean permanent-approval fields", () => {
+    const booleanRequest = {
+      ...request,
+      _meta: { app_name: "Safari" },
+      requestedSchema: {
+        type: "object",
+        properties: {
+          always: { type: "boolean", title: "Always allow Safari" },
+        },
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.ok(
+      describeMcpElicitation(booleanRequest).options.some(
+        (option) => option.decision === "acceptAlways",
+      ),
+    );
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(booleanRequest, "acceptAlways"), {
+      action: "accept",
+      _meta: { persist: "always" },
+      content: { always: true },
+    });
+  });
+
+  it("preserves valid nullable MCP form fields and persistence choices", () => {
+    const nullableRequest = {
+      ...request,
+      _meta: {
+        app_name: null,
+        appName: "Safari",
+        connector_name: null,
+        persist: null,
+        target: null,
+        tool_params: null,
+      },
+      requestedSchema: {
+        type: "object",
+        properties: {
+          approval: {
+            type: "string",
+            title: null,
+            description: null,
+            default: null,
+            enum: ["once", "always"],
+            enumNames: null,
+          },
+        },
+        required: ["approval"],
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.equal(describeMcpElicitation(nullableRequest).appName, "Safari");
+    NodeAssert.ok(
+      describeMcpElicitation(nullableRequest).options.some(
+        (option) => option.decision === "acceptAlways",
+      ),
+    );
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(nullableRequest, "acceptAlways"), {
+      action: "accept",
+      _meta: { persist: "always" },
+      content: { approval: "always" },
+    });
+  });
+
+  it("declines required form fields that an approval prompt cannot collect", () => {
+    const inputRequest = {
+      ...request,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          email: { type: "string", format: "email" },
+        },
+        required: ["email"],
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(inputRequest, "accept"), {
+      action: "decline",
+    });
+  });
+
+  it("does not approve URL elicitations without opening their requested URL", () => {
+    const urlRequest = {
+      mode: "url",
+      message: "Finish signing in to continue.",
+      serverName: "computer-use",
+      threadId: "provider-thread-1",
+      turnId: "turn-1",
+      elicitationId: "sign-in-1",
+      url: "https://example.com/authorize",
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(urlRequest, "accept"), {
+      action: "decline",
+    });
+  });
+
+  it("omits persistence choices that cannot satisfy required form fields", () => {
+    const onceOnlyRequest = {
+      ...request,
+      _meta: { app_name: "Safari", persist: ["session", "always"] },
+      requestedSchema: {
+        type: "object",
+        properties: {
+          approval: {
+            type: "string",
+            enum: ["once"],
+          },
+        },
+        required: ["approval"],
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.deepStrictEqual(describeMcpElicitation(onceOnlyRequest).options, [
+      { decision: "cancel", label: "Cancel" },
+      { decision: "decline", label: "Decline" },
+      { decision: "accept", label: "Approve" },
+    ]);
+  });
+});
+
 describe("buildCodexDeveloperInstructions", () => {
   it("appends runtime info after the mode instructions", () => {
     const instructions = buildCodexDeveloperInstructions("default", {
@@ -253,7 +794,7 @@ describe("buildCodexDeveloperInstructions", () => {
       reasoningEffort: "high",
     });
 
-    NodeAssert.ok(instructions.startsWith(CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS));
+    NodeAssert.ok(instructions.startsWith(codexDefaultModeDeveloperInstructions(true)));
     NodeAssert.match(instructions, /T3 Code/);
     NodeAssert.match(instructions, /Codex harness/);
     NodeAssert.match(instructions, /as gpt-5\.3-codex with high reasoning effort/);
@@ -265,7 +806,7 @@ describe("buildCodexDeveloperInstructions", () => {
       reasoningEffort: "medium",
     });
 
-    NodeAssert.ok(instructions.startsWith(CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS));
+    NodeAssert.ok(instructions.startsWith(codexPlanModeDeveloperInstructions(true)));
     NodeAssert.match(instructions, /as gpt-5\.3-codex with medium reasoning effort/);
   });
 
@@ -296,14 +837,40 @@ describe("buildCodexDeveloperInstructions", () => {
 describe("T3 browser developer instructions", () => {
   it("prefers the product-native preview tools in both collaboration modes", () => {
     for (const instructions of [
-      CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
-      CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+      codexDefaultModeDeveloperInstructions(true),
+      codexPlanModeDeveloperInstructions(true),
     ]) {
       NodeAssert.match(instructions, /t3-code/);
       NodeAssert.match(instructions, /preview_status/);
       NodeAssert.match(instructions, /preview_open/);
       NodeAssert.match(instructions, /Do not switch to global browser skills/);
     }
+  });
+
+  it("omits the browser block entirely when the preview tools are not attached", () => {
+    for (const instructions of [
+      codexDefaultModeDeveloperInstructions(false),
+      codexPlanModeDeveloperInstructions(false),
+    ]) {
+      NodeAssert.doesNotMatch(instructions, /preview_status/);
+      NodeAssert.doesNotMatch(instructions, /preview_open/);
+      NodeAssert.doesNotMatch(instructions, /T3 Code collaborative browser/);
+      // Steering away from other browser automation must go with the tools;
+      // keeping it would leave the model talked out of its only option.
+      NodeAssert.doesNotMatch(instructions, /Do not switch to global browser skills/);
+      // The rest of the collaboration mode is untouched.
+      NodeAssert.match(instructions, /<collaboration_mode>/);
+      NodeAssert.match(instructions, /<\/collaboration_mode>/);
+    }
+  });
+
+  it("tracks the turn's MCP configuration rather than defaulting to on", () => {
+    const runtime = { model: "gpt-5.3-codex", reasoningEffort: "high" };
+    NodeAssert.match(buildCodexDeveloperInstructions("default", runtime, true), /preview_open/);
+    NodeAssert.doesNotMatch(
+      buildCodexDeveloperInstructions("default", runtime, false),
+      /preview_open/,
+    );
   });
 });
 
@@ -314,6 +881,144 @@ describe("hasConfiguredMcpServer", () => {
     NodeAssert.equal(
       hasConfiguredMcpServer(["-c", 'mcp_servers.t3-code.url="http://127.0.0.1/mcp"']),
       true,
+    );
+  });
+});
+
+function makeThreadStartedNotification(
+  threadId: string,
+  source: EffectCodexSchema.V2ThreadStartedNotification["thread"]["source"],
+  threadSource?: string,
+) {
+  return {
+    method: "thread/started" as const,
+    params: {
+      thread: {
+        cliVersion: "0.0.0",
+        createdAt: 0,
+        cwd: "/tmp/project",
+        ephemeral: true,
+        id: threadId,
+        modelProvider: "openai",
+        preview: "",
+        sessionId: threadId,
+        source,
+        status: { type: "idle" as const },
+        ...(threadSource ? { threadSource } : {}),
+        turns: [],
+        updatedAt: 0,
+      },
+    },
+  };
+}
+
+describe("makeMemoryConsolidationNotificationFilter", () => {
+  it("suppresses memory consolidation without hiding other Codex subagents", () => {
+    const shouldSuppress = makeMemoryConsolidationNotificationFilter();
+
+    NodeAssert.equal(
+      shouldSuppress(
+        makeThreadStartedNotification("memory-thread", "unknown", "memory_consolidation"),
+      ),
+      true,
+    );
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "item/agentMessage/delta",
+        params: {
+          delta: "internal memory update",
+          itemId: "memory-message",
+          threadId: "memory-thread",
+          turnId: "memory-turn",
+        },
+      }),
+      true,
+    );
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "serverRequest/resolved",
+        params: {
+          requestId: "memory-approval",
+          threadId: "memory-thread",
+        },
+      }),
+      false,
+    );
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "warning",
+        params: {
+          message: "internal warning",
+          threadId: "memory-thread",
+        },
+      }),
+      true,
+    );
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "item/agentMessage/delta",
+        params: {
+          delta: "normal reply",
+          itemId: "root-message",
+          threadId: "root-thread",
+          turnId: "root-turn",
+        },
+      }),
+      false,
+    );
+
+    NodeAssert.equal(
+      shouldSuppress(
+        makeThreadStartedNotification("legacy-memory-thread", {
+          subAgent: "memory_consolidation",
+        }),
+      ),
+      true,
+    );
+
+    for (const source of [
+      { subAgent: "review" as const },
+      { subAgent: "compact" as const },
+      {
+        subAgent: {
+          thread_spawn: {
+            depth: 1,
+            parent_thread_id: "root-thread",
+          },
+        },
+      },
+    ]) {
+      NodeAssert.equal(
+        shouldSuppress(makeThreadStartedNotification("visible-subagent", source)),
+        false,
+      );
+    }
+  });
+
+  it("forgets memory consolidation threads after they close", () => {
+    const shouldSuppress = makeMemoryConsolidationNotificationFilter();
+    shouldSuppress(
+      makeThreadStartedNotification("memory-thread", "unknown", "memory_consolidation"),
+    );
+
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "thread/closed",
+        params: { threadId: "memory-thread" },
+      }),
+      true,
+    );
+    NodeAssert.equal(
+      shouldSuppress({
+        method: "item/agentMessage/delta",
+        params: {
+          delta: "later message",
+          itemId: "later-message",
+          threadId: "memory-thread",
+          turnId: "later-turn",
+        },
+      }),
+      false,
     );
   });
 });
@@ -358,12 +1063,51 @@ describe("isRecoverableThreadResumeError", () => {
     );
   });
 
+  it("matches a missing rollout for a known thread id", () => {
+    NodeAssert.equal(
+      isRecoverableThreadResumeError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "no rollout found for thread id 019fdf74-aaa9-7950-b252-7cc7a8650470",
+        }),
+      ),
+      true,
+    );
+  });
+
   it("ignores non-recoverable resume errors", () => {
     NodeAssert.equal(
       isRecoverableThreadResumeError(
         new CodexErrors.CodexAppServerRequestError({
           code: -32603,
           errorMessage: "Permission denied",
+        }),
+      ),
+      false,
+    );
+  });
+
+  it("classifies active writer only from the exact code and phrase", () => {
+    const exact = new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage: "thread 019f already has an active writer",
+    });
+    NodeAssert.equal(isCodexActiveWriterError(exact), true);
+    NodeAssert.equal(isRecoverableThreadResumeError(exact), false);
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32600,
+          errorMessage: "Invalid request",
+        }),
+      ),
+      false,
+    );
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "thread 019f already has an active writer",
         }),
       ),
       false,
@@ -466,6 +1210,39 @@ describe("openCodexThread", () => {
 
       NodeAssert.ok(isCodexAppServerRequestError(error));
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
+    }),
+  );
+
+  it.effect("never falls back to a new thread when the existing thread has a writer", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const client = {
+        request: <M extends "thread/start" | "thread/resume">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.fail(
+            new CodexErrors.CodexAppServerRequestError({
+              code: -32600,
+              errorMessage: "thread provider-thread-1 already has an active writer",
+            }),
+          );
+        },
+      };
+
+      const error = yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.3-codex",
+        serviceTier: undefined,
+        resumeThreadId: "provider-thread-1",
+      }).pipe(Effect.flip);
+
+      NodeAssert.equal(isCodexActiveWriterError(error), true);
+      NodeAssert.deepStrictEqual(calls, ["thread/resume"]);
     }),
   );
 });
