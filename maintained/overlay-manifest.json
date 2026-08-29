@@ -15,7 +15,8 @@
   ],
   "topology": {
     "miniLaunchOwner": "desktop-app",
-    "remoteTransport": "tailscale-https-bearer",
+    "remoteTransport": "t3-connect-relay",
+    "optionalDirectTransport": "tailscale-https-bearer",
     "disallowedConcurrentOwners": ["background-service", "ssh-launched-server", "npx-serve"]
   },
   "signing": {
@@ -97,26 +98,28 @@
     {
       "id": "single-authoritative-mini-backend",
       "decision": "native-configuration",
-      "intent": "Keep the Mini desktop backend as the only launch owner while the Air connects through stable Tailscale HTTPS bearer pairing.",
-      "retentionCondition": "Keep as configuration policy; do not restore the retired SSH-launch source patch.",
+      "intent": "Keep the Mini desktop backend as the only launch owner while the Air connects through the official T3 Connect relay, with Tailscale HTTPS bearer pairing as an optional direct fallback.",
+      "retentionCondition": "Keep as configuration policy; do not restore the retired SSH-launch source patch or select an SSH connection as the normal Air transport.",
       "reviewPaths": [
-        "apps/desktop/src/backend/DesktopServerExposure.ts",
-        "docs/user/remote-access.md"
+        "packages/client-runtime/src/connection/resolver.ts",
+        "apps/server/src/cloud/http.ts",
+        "apps/desktop/src/backend/DesktopServerExposure.ts"
       ],
       "requiredEvidence": [
         {
-          "path": "apps/desktop/src/backend/DesktopServerExposure.ts",
-          "contains": "tailscaleServeEnabled"
+          "path": "packages/client-runtime/src/connection/resolver.ts",
+          "contains": "RelayConnectionTarget"
         },
         {
-          "path": "docs/user/remote-access.md",
-          "contains": "npx t3 pair --tailscale"
+          "path": "apps/server/src/cloud/http.ts",
+          "contains": "reconcileDesiredCloudLink"
         }
       ],
       "upstreamEquivalentEvidence": [],
       "verify": [
         "Mini process inventory shows one desktop-owned T3 server",
-        "Air connects to the Mini Tailscale HTTPS endpoint without SSH launching a server"
+        "Air stores the Mini as a RelayConnectionTarget and opens a relay WebSocket without SSH launching a server",
+        "If the optional direct path is used, Air connects to the Mini Tailscale HTTPS endpoint through bearer pairing"
       ]
     },
     {
