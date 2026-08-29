@@ -133,6 +133,69 @@ describe("CodexCollabLifecycleBridge", () => {
     );
   });
 
+  it("routes only strict prepared task tokens through the host registration boundary", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const token = "dpt1_0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    const prepared = bridge.observeNativeDispatch({
+      id: "prepared-call",
+      taskName: token,
+      agentType: "reviewer",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+    });
+    NodeAssert.deepStrictEqual(
+      prepared[0]?.hook_event_name === "PreToolUse" ? prepared[0] : undefined,
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "parent-thread",
+        tool_name: "spawn_agent",
+        tool_use_id: "prepared-call",
+        tool_input: {
+          agent_type: "reviewer",
+          task_source: "prepared-host-registration",
+          prepared_task_token: token,
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+        },
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    );
+
+    const fallback = bridge.observeNativeDispatch({
+      id: "fallback-call",
+      taskName: "ordinary_task_name",
+    });
+    NodeAssert.deepStrictEqual(
+      fallback[0]?.hook_event_name === "PreToolUse" ? fallback[0].tool_input : undefined,
+      {
+        message: "Codex delegated task name: ordinary_task_name",
+        agent_type: "unknown",
+        task_source: "agent-path-fallback",
+      },
+    );
+
+    for (const taskName of [
+      "dpt1_0123456789ABCDEF0123456789abcdef0123456789abcdef",
+      "dpt1_0123456789abcdef0123456789abcdef0123456789abcde",
+      "prefix-dpt1_0123456789abcdef0123456789abcdef0123456789abcdef",
+    ]) {
+      const lookalike = bridge.observeNativeDispatch({
+        id: `lookalike-${taskName}`,
+        taskName,
+      });
+      NodeAssert.deepStrictEqual(
+        lookalike[0]?.hook_event_name === "PreToolUse" ? lookalike[0].tool_input : undefined,
+        {
+          message: `Codex delegated task name: ${taskName}`,
+          agent_type: "unknown",
+          task_source: "agent-path-fallback",
+        },
+      );
+    }
+  });
+
   it("accepts only a normalized semantic version from the app-server user agent", () => {
     NodeAssert.equal(parseCodexAppServerVersion("codex-cli/0.151.0 (Mac OS 26.0)"), "0.151.0");
     NodeAssert.equal(parseCodexAppServerVersion("codex-cli/not-a-version"), undefined);
