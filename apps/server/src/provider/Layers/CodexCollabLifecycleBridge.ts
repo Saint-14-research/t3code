@@ -9,6 +9,7 @@ export interface CodexCollabLifecycleToolCall {
   readonly model?: string | null | undefined;
   readonly reasoningEffort?: string | null | undefined;
   readonly receiverThreadIds: ReadonlyArray<string>;
+  readonly status?: "inProgress" | "completed" | "failed" | "interrupted";
 }
 
 export type CodexCollabLifecycleHookPayload =
@@ -42,6 +43,19 @@ export type CodexCollabLifecycleHookPayload =
       readonly agent_type: string;
       readonly tool_use_id: string;
       readonly status: "completed" | "cancelled" | "failed";
+      readonly consumer_surface: "t3-native-collaboration";
+      readonly bridge_version: typeof BRIDGE_VERSION;
+    }
+  | {
+      readonly hook_event_name: "PostToolUseFailure";
+      readonly session_id: string;
+      readonly tool_use_id: string;
+      readonly consumer_surface: "t3-native-collaboration";
+      readonly bridge_version: typeof BRIDGE_VERSION;
+    }
+  | {
+      readonly hook_event_name: "SessionEnd";
+      readonly session_id: string;
       readonly consumer_surface: "t3-native-collaboration";
       readonly bridge_version: typeof BRIDGE_VERSION;
     };
@@ -79,6 +93,7 @@ interface Attempt {
   startSeen: boolean;
   terminalSeen: boolean;
   terminalStatus: "completed" | "cancelled" | "failed" | undefined;
+  failureSeen: boolean;
 }
 
 /**
@@ -91,6 +106,8 @@ export class CodexCollabLifecycleBridge {
   readonly #attemptsByToolUseId = new Map<string, Attempt>();
   readonly #attemptsByAgentId = new Map<string, Attempt>();
   readonly #terminalAgentStatuses = new Map<string, "completed" | "cancelled" | "failed">();
+  readonly #agentTypes = new Map<string, string>();
+  #sessionEndSeen = false;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
@@ -101,7 +118,10 @@ export class CodexCollabLifecycleBridge {
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
     const existing = this.#attemptsByToolUseId.get(call.id);
     if (existing) {
-      return this.#bind(existing, call.receiverThreadIds);
+      return [
+        ...this.#bind(existing, call.receiverThreadIds),
+        ...this.#failUnbound(existing, call.status),
+      ];
     }
 
     const attempt: Attempt = {
@@ -115,11 +135,16 @@ export class CodexCollabLifecycleBridge {
       startSeen: false,
       terminalSeen: false,
       terminalStatus: undefined,
+      failureSeen: false,
     };
     this.#attemptsByToolUseId.set(call.id, attempt);
     const preToolUse = this.#preToolUse(attempt);
     attempt.prompt = "";
-    return [preToolUse, ...this.#bind(attempt, call.receiverThreadIds)];
+    return [
+      preToolUse,
+      ...this.#bind(attempt, call.receiverThreadIds),
+      ...this.#failUnbound(attempt, call.status),
+    ];
   }
 
   observeChildTerminal(
@@ -128,7 +153,7 @@ export class CodexCollabLifecycleBridge {
     agentType?: string | undefined,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
     const attempt = this.#attemptsByAgentId.get(agentId);
-    if (!attempt) {
+    if (!attempt || (attempt.terminalSeen && this.#hasUnboundAttempt())) {
       this.#terminalAgentStatuses.set(agentId, status);
       return [];
     }
@@ -145,11 +170,13 @@ export class CodexCollabLifecycleBridge {
     agentId: string,
     agentType: string | undefined,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+    const normalizedAgentType = nonEmptyString(agentType) ?? "unknown";
+    this.#agentTypes.set(agentId, normalizedAgentType);
     const attempt = this.#attemptsByAgentId.get(agentId);
     if (!attempt || attempt.startSeen) {
       return [];
     }
-    attempt.agentType = nonEmptyString(agentType) ?? "unknown";
+    attempt.agentType = normalizedAgentType;
     return this.#startAndMaybeStop(attempt, agentId);
   }
 
@@ -160,13 +187,26 @@ export class CodexCollabLifecycleBridge {
     }>,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
     const agentTypes = new Map(children.map((child) => [child.agentId, child.agentType]));
-    return [...this.#attemptsByAgentId.keys()].flatMap((agentId) =>
+    const terminalPayloads = [...this.#attemptsByAgentId.keys()].flatMap((agentId) =>
       this.observeChildTerminal(agentId, "cancelled", agentTypes.get(agentId)),
     );
+    if (this.#sessionEndSeen) {
+      return terminalPayloads;
+    }
+    this.#sessionEndSeen = true;
+    return [
+      ...terminalPayloads,
+      {
+        hook_event_name: "SessionEnd",
+        session_id: this.sessionId,
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: BRIDGE_VERSION,
+      },
+    ];
   }
 
   #bind(attempt: Attempt, receiverThreadIds: ReadonlyArray<string>) {
-    if (attempt.agentId !== undefined || receiverThreadIds.length !== 1) {
+    if (attempt.agentId !== undefined || attempt.failureSeen || receiverThreadIds.length !== 1) {
       return [];
     }
     const [agentId] = receiverThreadIds;
@@ -174,6 +214,8 @@ export class CodexCollabLifecycleBridge {
       return [];
     }
     attempt.agentId = agentId;
+    const previousAttempt = this.#attemptsByAgentId.get(agentId);
+    attempt.agentType = this.#agentTypes.get(agentId) ?? previousAttempt?.agentType;
     const bufferedTerminalStatus = this.#terminalAgentStatuses.get(agentId);
     if (bufferedTerminalStatus) {
       attempt.terminalSeen = true;
@@ -182,6 +224,35 @@ export class CodexCollabLifecycleBridge {
     }
     this.#attemptsByAgentId.set(agentId, attempt);
     return attempt.terminalSeen ? this.#startAndMaybeStop(attempt, agentId) : [];
+  }
+
+  #failUnbound(
+    attempt: Attempt,
+    status: CodexCollabLifecycleToolCall["status"],
+  ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+    if (
+      attempt.agentId !== undefined ||
+      attempt.failureSeen ||
+      (status !== "failed" && status !== "interrupted")
+    ) {
+      return [];
+    }
+    attempt.failureSeen = true;
+    return [
+      {
+        hook_event_name: "PostToolUseFailure",
+        session_id: this.sessionId,
+        tool_use_id: attempt.toolUseId,
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: BRIDGE_VERSION,
+      },
+    ];
+  }
+
+  #hasUnboundAttempt(): boolean {
+    return [...this.#attemptsByToolUseId.values()].some(
+      (attempt) => attempt.agentId === undefined && !attempt.failureSeen,
+    );
   }
 
   #preToolUse(attempt: Attempt): CodexCollabLifecycleHookPayload {
