@@ -25,6 +25,7 @@ import {
   buildTurnStartParams,
   describeMcpElicitation,
   hasConfiguredMcpServer,
+  isCodexActiveWriterError,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
   openCodexThread,
@@ -131,6 +132,61 @@ describe("CodexCollabLifecycleBridge", () => {
     );
     NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-a", "cancelled"), []);
   });
+
+  it("terminalizes registered active children when their session closes", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the session",
+      receiverThreadIds: ["active-child"],
+    });
+    bridge.observeChildRole("active-child", "reviewer");
+
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [
+        {
+          hook_event_name: "SubagentStop",
+          session_id: "parent-thread",
+          agent_id: "active-child",
+          agent_type: "reviewer",
+          tool_use_id: "close-tool",
+          status: "cancelled",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+      ],
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [],
+    );
+  });
+
+  it("terminalizes a bound child when the session closes before child registration", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "early-close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the startup window",
+      receiverThreadIds: ["unregistered-child"],
+    });
+
+    const payloads = bridge.observeSessionClose([]);
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      payloads[0]?.hook_event_name === "SubagentStart" ? payloads[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStop" ? payloads[1].status : undefined,
+      "cancelled",
+    );
+  });
 });
 
 describe("parseCodexCollabLifecycleHookArgv", () => {
@@ -143,7 +199,10 @@ describe("parseCodexCollabLifecycleHookArgv", () => {
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv("hook --unsafe"), undefined);
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv("[]"), undefined);
     NodeAssert.equal(parseCodexCollabLifecycleHookArgv('["hook", 1]'), undefined);
-    NodeAssert.equal(CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV, "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV");
+    NodeAssert.equal(
+      CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+      "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV",
+    );
   });
 });
 
@@ -897,6 +956,33 @@ describe("isRecoverableThreadResumeError", () => {
     );
   });
 
+  it("classifies active writer only from the exact code and phrase", () => {
+    const exact = new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage: "thread 019f already has an active writer",
+    });
+    NodeAssert.equal(isCodexActiveWriterError(exact), true);
+    NodeAssert.equal(isRecoverableThreadResumeError(exact), false);
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32600,
+          errorMessage: "Invalid request",
+        }),
+      ),
+      false,
+    );
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "thread 019f already has an active writer",
+        }),
+      ),
+      false,
+    );
+  });
+
   it("ignores unrelated missing-resource errors that do not mention threads", () => {
     NodeAssert.equal(
       isRecoverableThreadResumeError(
@@ -993,6 +1079,39 @@ describe("openCodexThread", () => {
 
       NodeAssert.ok(isCodexAppServerRequestError(error));
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
+    }),
+  );
+
+  it.effect("never falls back to a new thread when the existing thread has a writer", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const client = {
+        request: <M extends "thread/start" | "thread/resume">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.fail(
+            new CodexErrors.CodexAppServerRequestError({
+              code: -32600,
+              errorMessage: "thread provider-thread-1 already has an active writer",
+            }),
+          );
+        },
+      };
+
+      const error = yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.3-codex",
+        serviceTier: undefined,
+        resumeThreadId: "provider-thread-1",
+      }).pipe(Effect.flip);
+
+      NodeAssert.equal(isCodexActiveWriterError(error), true);
+      NodeAssert.deepStrictEqual(calls, ["thread/resume"]);
     }),
   );
 });

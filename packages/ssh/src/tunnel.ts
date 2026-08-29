@@ -65,6 +65,8 @@ export interface RemoteT3RunnerOptions {
   readonly desktopCli?: {
     readonly executablePath: string;
     readonly entryPath: string;
+    readonly fallbackExecutablePath?: string;
+    readonly fallbackEntryPath?: string;
     readonly version: string;
   } | null;
 }
@@ -323,6 +325,55 @@ function probe() {
 })().catch(() => process.exit(1));
 `;
 
+export const REMOTE_DISCOVER_T3_SERVER_SCRIPT = `const http = require("node:http");
+const port = Number.parseInt(process.argv[2] ?? "", 10);
+const probeTimeoutMs = Number.parseInt(process.argv[3] ?? "", 10);
+if (!Number.isInteger(port) || !Number.isInteger(probeTimeoutMs)) {
+  process.exit(1);
+}
+
+const request = http.get(
+  {
+    hostname: "127.0.0.1",
+    port,
+    path: "/.well-known/t3/environment",
+    timeout: probeTimeoutMs,
+  },
+  (response) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) {
+        request.destroy();
+      }
+    });
+    response.once("end", () => {
+      try {
+        const descriptor = JSON.parse(body);
+        const isT3 =
+          response.statusCode >= 200 &&
+          response.statusCode < 300 &&
+          typeof descriptor === "object" &&
+          descriptor !== null &&
+          typeof descriptor.environmentId === "string" &&
+          descriptor.environmentId.trim().length > 0 &&
+          typeof descriptor.serverVersion === "string" &&
+          descriptor.serverVersion.trim().length > 0;
+        if (!isT3) {
+          process.exit(1);
+        }
+        process.stdout.write(String(port));
+      } catch {
+        process.exit(1);
+      }
+    });
+  },
+);
+request.once("timeout", () => request.destroy());
+request.once("error", () => process.exit(1));
+`;
+
 export const REMOTE_NODE_ENV_SCRIPT = `prepend_path_if_dir() {
   if [ -d "$1" ]; then
     case ":$PATH:" in
@@ -430,13 +481,22 @@ if [ -n "$T3_NODE_SCRIPT_PATH" ]; then
 fi
 T3_DESKTOP_CLI_EXECUTABLE=@@T3_DESKTOP_CLI_EXECUTABLE@@
 T3_DESKTOP_CLI_ENTRY=@@T3_DESKTOP_CLI_ENTRY@@
+T3_DESKTOP_CLI_FALLBACK_EXECUTABLE=@@T3_DESKTOP_CLI_FALLBACK_EXECUTABLE@@
+T3_DESKTOP_CLI_FALLBACK_ENTRY=@@T3_DESKTOP_CLI_FALLBACK_ENTRY@@
 T3_DESKTOP_CLI_VERSION=@@T3_DESKTOP_CLI_VERSION@@
-if [ -n "$T3_DESKTOP_CLI_EXECUTABLE" ] && [ -x "$T3_DESKTOP_CLI_EXECUTABLE" ]; then
-  T3_INSTALLED_DESKTOP_CLI_VERSION="$(env ELECTRON_RUN_AS_NODE=1 "$T3_DESKTOP_CLI_EXECUTABLE" "$T3_DESKTOP_CLI_ENTRY" --version 2>/dev/null || true)"
-  if [ "$T3_INSTALLED_DESKTOP_CLI_VERSION" = "t3 v$T3_DESKTOP_CLI_VERSION" ]; then
-    exec env ELECTRON_RUN_AS_NODE=1 "$T3_DESKTOP_CLI_EXECUTABLE" "$T3_DESKTOP_CLI_ENTRY" "$@"
+run_matching_desktop_cli() {
+  DESKTOP_EXECUTABLE="$1"
+  DESKTOP_ENTRY="$2"
+  shift 2
+  if [ -n "$DESKTOP_EXECUTABLE" ] && [ -x "$DESKTOP_EXECUTABLE" ]; then
+    T3_INSTALLED_DESKTOP_CLI_VERSION="$(env ELECTRON_RUN_AS_NODE=1 "$DESKTOP_EXECUTABLE" "$DESKTOP_ENTRY" --version 2>/dev/null || true)"
+    if [ "$T3_INSTALLED_DESKTOP_CLI_VERSION" = "t3 v$T3_DESKTOP_CLI_VERSION" ]; then
+      exec env ELECTRON_RUN_AS_NODE=1 "$DESKTOP_EXECUTABLE" "$DESKTOP_ENTRY" "$@"
+    fi
   fi
-fi
+}
+run_matching_desktop_cli "$T3_DESKTOP_CLI_EXECUTABLE" "$T3_DESKTOP_CLI_ENTRY" "$@"
+run_matching_desktop_cli "$T3_DESKTOP_CLI_FALLBACK_EXECUTABLE" "$T3_DESKTOP_CLI_FALLBACK_ENTRY" "$@"
 if command -v t3 >/dev/null 2>&1; then
   exec t3 "$@"
 fi
@@ -474,15 +534,32 @@ DEFAULT_SERVER_HOME="$HOME/.t3"
 DEFAULT_RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"
 PORT_FILE="$STATE_DIR/port"
 PID_FILE="$STATE_DIR/pid"
+PID_START_FILE="$STATE_DIR/pid-start"
 MANAGED_FILE="$STATE_DIR/managed"
 LOG_FILE="$STATE_DIR/server.log"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
 RUNNER_NEXT="$STATE_DIR/run-t3.next.$$"
+LAUNCH_LOCK_FILE="$HOME/.t3/ssh-launch/.launch.lock"
 mkdir -p "$STATE_DIR"
-cleanup_runner_next() {
+cleanup_launch() {
   rm -f "$RUNNER_NEXT"
 }
-trap cleanup_runner_next EXIT
+trap cleanup_launch EXIT
+exec 9>"$LAUNCH_LOCK_FILE"
+if command -v lockf >/dev/null 2>&1; then
+  if ! lockf -s -t 85 9; then
+    printf 'Timed out waiting for another T3 SSH launcher on this host. Retry the connection.\n' >&2
+    exit 1
+  fi
+elif command -v flock >/dev/null 2>&1; then
+  if ! flock -w 85 9; then
+    printf 'Timed out waiting for another T3 SSH launcher on this host. Retry the connection.\n' >&2
+    exit 1
+  fi
+else
+  printf 'Remote host cannot safely coordinate T3 launchers because lockf/flock is unavailable. Install one of those tools, then retry the connection.\n' >&2
+  exit 1
+fi
 cat >"$RUNNER_NEXT" <<'SH'
 @@T3_RUNNER_SCRIPT@@
 SH
@@ -506,6 +583,21 @@ wait_ready() {
 @@T3_WAIT_READY_SCRIPT@@
 NODE
 }
+discover_default_t3_server() {
+  DISCOVERY_PORT="\${1:-@@T3_DEFAULT_REMOTE_PORT@@}"
+  node - "$DISCOVERY_PORT" "@@T3_READY_PROBE_TIMEOUT_MS@@" <<'NODE'
+@@T3_DISCOVER_T3_SERVER_SCRIPT@@
+NODE
+}
+desktop_cli_is_installed() {
+  if { [ -n @@T3_DESKTOP_CLI_EXECUTABLE@@ ] && [ -x @@T3_DESKTOP_CLI_EXECUTABLE@@ ]; } ||
+    { [ -n @@T3_DESKTOP_CLI_ENTRY@@ ] && [ -f @@T3_DESKTOP_CLI_ENTRY@@ ]; } ||
+    { [ -n @@T3_DESKTOP_CLI_FALLBACK_EXECUTABLE@@ ] && [ -x @@T3_DESKTOP_CLI_FALLBACK_EXECUTABLE@@ ]; } ||
+    { [ -n @@T3_DESKTOP_CLI_FALLBACK_ENTRY@@ ] && [ -f @@T3_DESKTOP_CLI_FALLBACK_ENTRY@@ ]; }; then
+    return 0
+  fi
+  return 1
+}
 wait_for_pid_exit() {
   PID_TO_WAIT="$1"
   WAIT_COUNT=0
@@ -513,6 +605,42 @@ wait_for_pid_exit() {
     WAIT_COUNT=$((WAIT_COUNT + 1))
     sleep 0.1
   done
+}
+is_same_process_tree() {
+  ROOT_PID="$1"
+  CURRENT_PID="$2"
+  RECORDED_PROCESS_START="$(cat "$PID_START_FILE" 2>/dev/null || true)"
+  CURRENT_PROCESS_START="$(ps -o lstart= -p "$ROOT_PID" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+  if [ -z "$RECORDED_PROCESS_START" ] || [ "$CURRENT_PROCESS_START" != "$RECORDED_PROCESS_START" ]; then
+    return 1
+  fi
+  while [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" -gt 1 ] 2>/dev/null; do
+    if [ "$CURRENT_PID" = "$ROOT_PID" ]; then
+      return 0
+    fi
+    CURRENT_PID="$(ps -o ppid= -p "$CURRENT_PID" 2>/dev/null | tr -d '[:space:]')"
+  done
+  return 1
+}
+record_managed_pid_identity() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' >"$PID_START_FILE"
+}
+is_managed_t3_process() {
+  PID_TO_CHECK="$1"
+  PORT_TO_CHECK="$2"
+  if [ -z "$PID_TO_CHECK" ] || [ -z "$PORT_TO_CHECK" ] || ! kill -0 "$PID_TO_CHECK" 2>/dev/null; then
+    return 1
+  fi
+  RECORDED_PROCESS_START="$(cat "$PID_START_FILE" 2>/dev/null || true)"
+  CURRENT_PROCESS_START="$(ps -o lstart= -p "$PID_TO_CHECK" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+  if [ -z "$RECORDED_PROCESS_START" ] || [ "$CURRENT_PROCESS_START" != "$RECORDED_PROCESS_START" ]; then
+    return 1
+  fi
+  PROCESS_COMMAND="$(ps -o command= -p "$PID_TO_CHECK" 2>/dev/null || true)"
+  case "$PROCESS_COMMAND" in
+    *serve*"--port $PORT_TO_CHECK"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 resolve_default_runtime_port() {
   node - "$DEFAULT_RUNTIME_FILE" <<'NODE'
@@ -547,24 +675,30 @@ if [ -n "$DEFAULT_RUNTIME_INFO" ]; then
   DEFAULT_REMOTE_PORT="\${DEFAULT_RUNTIME_INFO#* }"
 fi
 # The shared runtime descriptor also points at SSH-managed servers. Never
-# mistake our own PID for a desktop-owned backend and relabel it as external.
-if [ -n "$DEFAULT_RUNTIME_PID" ] && [ -n "$REMOTE_PID" ] && [ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]; then
+# mistake our own process tree for a desktop-owned backend and relabel it as
+# external. npm can keep a wrapper parent between this launcher and T3's node
+# process, so equality alone is insufficient.
+if [ -n "$DEFAULT_RUNTIME_PID" ] && [ -n "$REMOTE_PID" ] && [ "$REMOTE_MANAGED" = "managed" ] && is_same_process_tree "$REMOTE_PID" "$DEFAULT_RUNTIME_PID"; then
+  REMOTE_PID="$DEFAULT_RUNTIME_PID"
+  printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
+  record_managed_pid_identity "$REMOTE_PID"
   DEFAULT_RUNTIME_PID=""
   DEFAULT_REMOTE_PORT=""
 fi
 if [ -n "$DEFAULT_REMOTE_PORT" ]; then
+  PREVIOUS_REMOTE_PORT="$REMOTE_PORT"
   REMOTE_PORT="$DEFAULT_REMOTE_PORT"
   if wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
     if [ "$REMOTE_MANAGED" = "managed" ]; then
       PID_TO_STOP="\${REMOTE_PID:-$DEFAULT_RUNTIME_PID}"
-      if [ -n "$PID_TO_STOP" ] && kill -0 "$PID_TO_STOP" 2>/dev/null; then
+      if is_managed_t3_process "$PID_TO_STOP" "$PREVIOUS_REMOTE_PORT"; then
         kill "$PID_TO_STOP" 2>/dev/null || true
         wait_for_pid_exit "$PID_TO_STOP"
       fi
       REMOTE_PID=""
       REMOTE_PORT="$DEFAULT_REMOTE_PORT"
       REMOTE_MANAGED="external"
-      rm -f "$PID_FILE"
+      rm -f "$PID_FILE" "$PID_START_FILE"
       printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
       printf 'external\\n' >"$MANAGED_FILE"
     else
@@ -585,7 +719,7 @@ if [ "$REMOTE_MANAGED" = "external" ]; then
     REMOTE_PORT=""
     REMOTE_MANAGED=""
   fi
-elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
+elif is_managed_t3_process "$REMOTE_PID" "$REMOTE_PORT"; then
   if [ "$RUNNER_CHANGED" -eq 1 ]; then
     kill "$REMOTE_PID" 2>/dev/null || true
     wait_for_pid_exit "$REMOTE_PID"
@@ -599,20 +733,41 @@ elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/d
     REMOTE_PORT=""
     REMOTE_MANAGED=""
   fi
+elif [ -n "$REMOTE_PORT" ] && [ "$(discover_default_t3_server "$REMOTE_PORT" 2>/dev/null || true)" = "$REMOTE_PORT" ]; then
+  REMOTE_PID=""
+  REMOTE_MANAGED="external"
+  rm -f "$PID_FILE" "$PID_START_FILE"
+  printf 'external\\n' >"$MANAGED_FILE"
 else
   REMOTE_PID=""
   REMOTE_PORT=""
   REMOTE_MANAGED=""
 fi
 if [ -z "$REMOTE_PORT" ]; then
+  DISCOVERED_REMOTE_PORT="$(discover_default_t3_server 2>/dev/null || true)"
+  if [ -n "$DISCOVERED_REMOTE_PORT" ]; then
+    REMOTE_PID=""
+    REMOTE_PORT="$DISCOVERED_REMOTE_PORT"
+    REMOTE_MANAGED="external"
+    rm -f "$PID_FILE" "$PID_START_FILE"
+    printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
+    printf 'external\\n' >"$MANAGED_FILE"
+  fi
+fi
+if [ -z "$REMOTE_PORT" ]; then
+  if desktop_cli_is_installed; then
+    printf 'The remote T3 desktop app is installed but its server is not running. Open T3 Code on the remote Mac, then retry the connection.\\n' >&2
+    exit 1
+  fi
   REMOTE_PORT="$(pick_port)" || true
   if [ -z "$REMOTE_PORT" ]; then
     printf 'Failed to find an available port on the remote host. Ensure node is available on PATH.\\n' >&2
     exit 1
   fi
-  nohup env T3CODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$DEFAULT_SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
+  nohup env T3CODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$DEFAULT_SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null 9>&- &
   REMOTE_PID="$!"
   printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
+  record_managed_pid_identity "$REMOTE_PID"
   printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
   printf 'managed\\n' >"$MANAGED_FILE"
   if ! wait_ready "@@T3_READY_TIMEOUT_MS@@"; then
@@ -624,8 +779,16 @@ if [ -z "$REMOTE_PORT" ]; then
     fi
     kill "$REMOTE_PID" 2>/dev/null || true
     wait_for_pid_exit "$REMOTE_PID"
-    rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+    rm -f "$PID_FILE" "$PID_START_FILE" "$PORT_FILE" "$MANAGED_FILE"
     exit 1
+  fi
+  MANAGED_RUNTIME_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
+  MANAGED_RUNTIME_PID="\${MANAGED_RUNTIME_INFO%% *}"
+  MANAGED_RUNTIME_PORT="\${MANAGED_RUNTIME_INFO#* }"
+  if [ -n "$MANAGED_RUNTIME_INFO" ] && [ "$MANAGED_RUNTIME_PORT" = "$REMOTE_PORT" ] && is_same_process_tree "$REMOTE_PID" "$MANAGED_RUNTIME_PID"; then
+    REMOTE_PID="$MANAGED_RUNTIME_PID"
+    printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
+    record_managed_pid_identity "$REMOTE_PID"
   fi
 fi
 printf '{"remotePort":%s,"serverKind":"%s"}\\n' "$REMOTE_PORT" "\${REMOTE_MANAGED:-managed}"
@@ -647,11 +810,20 @@ PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
 export const REMOTE_STOP_SCRIPT = `set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 PID_FILE="$STATE_DIR/pid"
+PID_START_FILE="$STATE_DIR/pid-start"
 PORT_FILE="$STATE_DIR/port"
 MANAGED_FILE="$STATE_DIR/managed"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
+REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
+PROCESS_COMMAND="$(ps -o command= -p "$REMOTE_PID" 2>/dev/null || true)"
+case "$PROCESS_COMMAND" in
+  *serve*"--port $REMOTE_PORT"*) REMOTE_PID_MATCHES=1 ;;
+  *) REMOTE_PID_MATCHES=0 ;;
+esac
+RECORDED_PROCESS_START="$(cat "$PID_START_FILE" 2>/dev/null || true)"
+CURRENT_PROCESS_START="$(ps -o lstart= -p "$REMOTE_PID" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+if [ "$REMOTE_MANAGED" != "external" ] && [ "$REMOTE_PID_MATCHES" -eq 1 ] && [ -n "$RECORDED_PROCESS_START" ] && [ "$CURRENT_PROCESS_START" = "$RECORDED_PROCESS_START" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
   kill "$REMOTE_PID" 2>/dev/null || true
   WAIT_COUNT=0
   while kill -0 "$REMOTE_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 20 ]; do
@@ -659,7 +831,7 @@ if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMO
     sleep 0.1
   done
 fi
-rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+rm -f "$PID_FILE" "$PID_START_FILE" "$PORT_FILE" "$MANAGED_FILE"
 printf '{"stopped":true}\\n'
 `;
 
@@ -681,6 +853,10 @@ export function buildRemoteT3RunnerScript(input?: RemoteT3RunnerOptions): string
       T3_NODE_SCRIPT_PATH: shellSingleQuote(nodeScriptPath),
       T3_DESKTOP_CLI_EXECUTABLE: shellSingleQuote(desktopCli?.executablePath.trim() || ""),
       T3_DESKTOP_CLI_ENTRY: shellSingleQuote(desktopCli?.entryPath.trim() || ""),
+      T3_DESKTOP_CLI_FALLBACK_EXECUTABLE: shellSingleQuote(
+        desktopCli?.fallbackExecutablePath?.trim() || "",
+      ),
+      T3_DESKTOP_CLI_FALLBACK_ENTRY: shellSingleQuote(desktopCli?.fallbackEntryPath?.trim() || ""),
       T3_DESKTOP_CLI_VERSION: shellSingleQuote(desktopCli?.version.trim() || ""),
       T3_NODE_ENV_SCRIPT: buildRemoteNodeEnvScript(input),
     }),
@@ -702,8 +878,17 @@ export function buildRemoteLaunchScript(input?: RemoteT3RunnerOptions): string {
     T3_RUNNER_SCRIPT: stripTrailingNewlines(buildRemoteT3RunnerScript(input)),
     T3_PICK_PORT_SCRIPT: stripTrailingNewlines(REMOTE_PICK_PORT_SCRIPT),
     T3_WAIT_READY_SCRIPT: stripTrailingNewlines(REMOTE_WAIT_READY_SCRIPT),
+    T3_DISCOVER_T3_SERVER_SCRIPT: stripTrailingNewlines(REMOTE_DISCOVER_T3_SERVER_SCRIPT),
     T3_DEFAULT_REMOTE_PORT: String(DEFAULT_REMOTE_PORT),
     T3_REMOTE_PORT_SCAN_WINDOW: String(REMOTE_PORT_SCAN_WINDOW),
+    T3_DESKTOP_CLI_EXECUTABLE: shellSingleQuote(input?.desktopCli?.executablePath.trim() || ""),
+    T3_DESKTOP_CLI_ENTRY: shellSingleQuote(input?.desktopCli?.entryPath.trim() || ""),
+    T3_DESKTOP_CLI_FALLBACK_EXECUTABLE: shellSingleQuote(
+      input?.desktopCli?.fallbackExecutablePath?.trim() || "",
+    ),
+    T3_DESKTOP_CLI_FALLBACK_ENTRY: shellSingleQuote(
+      input?.desktopCli?.fallbackEntryPath?.trim() || "",
+    ),
     T3_READY_TIMEOUT_MS: String(REMOTE_READY_TIMEOUT_MS),
     T3_REUSE_READY_TIMEOUT_MS: String(REMOTE_REUSE_READY_TIMEOUT_MS),
     T3_READY_PROBE_TIMEOUT_MS: String(SSH_READY_PROBE_TIMEOUT_MS),

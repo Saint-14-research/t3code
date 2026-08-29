@@ -32,6 +32,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
@@ -1162,46 +1163,75 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const runStopAll = Effect.fn("runStopAll")(function* () {
     const threadIds = yield* directory.listThreadIds();
     const currentAdapters = yield* getAdapterEntries;
-    const activeSessions = yield* Effect.forEach(currentAdapters, ([instanceId, adapter]) =>
-      adapter.listSessions().pipe(
-        Effect.map((sessions) =>
-          sessions.map((session) => ({
-            ...session,
-            providerInstanceId: instanceId,
-          })),
+    const activeSessions = yield* Effect.forEach(
+      currentAdapters,
+      ([instanceId, adapter]) =>
+        adapter.listSessions().pipe(
+          Effect.map((sessions) =>
+            sessions.map((session) => ({
+              ...session,
+              providerInstanceId: instanceId,
+            })),
+          ),
         ),
-      ),
+      { concurrency: 4 },
     ).pipe(Effect.map((sessionsByAdapter) => sessionsByAdapter.flatMap((sessions) => sessions)));
-    yield* Effect.forEach(activeSessions, (session) =>
-      Effect.flatMap(nowIso, (lastRuntimeEventAt) =>
-        upsertSessionBinding(session, session.threadId, {
-          lastRuntimeEvent: "provider.stopAll",
-          lastRuntimeEventAt,
-        }),
-      ),
+    yield* Effect.forEach(
+      activeSessions,
+      (session) =>
+        Effect.flatMap(nowIso, (lastRuntimeEventAt) =>
+          upsertSessionBinding(session, session.threadId, {
+            lastRuntimeEvent: "provider.stopAll",
+            lastRuntimeEventAt,
+          }),
+        ),
+      { concurrency: 4 },
     ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
+    const stopResults = yield* Effect.forEach(
+      currentAdapters,
+      ([instanceId, adapter]) =>
+        adapter.stopAll().pipe(
+          Effect.result,
+          Effect.map((result) => ({ instanceId, result })),
+        ),
+      { concurrency: 4 },
+    );
+    for (const { instanceId, result } of stopResults) {
+      if (Result.isFailure(result)) {
+        yield* Effect.logWarning("failed to stop provider adapter", {
+          providerInstanceId: instanceId,
+          errorTag: result.failure._tag,
+        });
+      }
+    }
+    const firstStopFailure = stopResults.find(({ result }) => Result.isFailure(result));
+    if (firstStopFailure !== undefined && Result.isFailure(firstStopFailure.result)) {
+      return yield* firstStopFailure.result.failure;
+    }
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));
-    yield* Effect.forEach(bindings, (binding) =>
-      Effect.gen(function* () {
-        const providerInstanceId = dieOnMissingBindingInstanceId(
-          "ProviderService.stopAll",
-          binding,
-        );
-        return yield* directory.upsert({
-          threadId: binding.threadId,
-          provider: binding.provider,
-          providerInstanceId,
-          status: "stopped",
-          runtimePayload: {
-            activeTurnId: null,
-            lastRuntimeEvent: "provider.stopAll",
-            lastRuntimeEventAt: yield* nowIso,
-          },
-        });
-      }),
+    yield* Effect.forEach(
+      bindings,
+      (binding) =>
+        Effect.gen(function* () {
+          const providerInstanceId = dieOnMissingBindingInstanceId(
+            "ProviderService.stopAll",
+            binding,
+          );
+          return yield* directory.upsert({
+            threadId: binding.threadId,
+            provider: binding.provider,
+            providerInstanceId,
+            status: "stopped",
+            runtimePayload: {
+              activeTurnId: null,
+              lastRuntimeEvent: "provider.stopAll",
+              lastRuntimeEventAt: yield* nowIso,
+            },
+          });
+        }),
+      { concurrency: 4 },
     ).pipe(Effect.asVoid);
     yield* analytics.record("provider.sessions.stopped_all", {
       sessionCount: threadIds.length,

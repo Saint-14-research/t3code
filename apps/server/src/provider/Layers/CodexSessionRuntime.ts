@@ -19,6 +19,7 @@ import {
 } from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { normalizeModelSlug } from "@t3tools/shared/model";
+import { HostProcessExecutablePath, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -49,6 +50,14 @@ import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { buildCodexDeveloperInstructions } from "../CodexDeveloperInstructions.ts";
+import {
+  CODEX_PROVIDER_GUARDIAN_LOG_PREFIX,
+  CODEX_PROVIDER_GUARDIAN_FAILURE_EXIT_CODE,
+  CODEX_PROVIDER_GUARDIAN_SPEC_ENV,
+  encodeCodexProviderGuardianSpec,
+  resolveCodexProviderGuardianEntry,
+  resolveCodexProviderGuardianRuntimeArgs,
+} from "../../providerGuardian.ts";
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
 
 const PROVIDER = ProviderDriverKind.make("codex");
@@ -61,12 +70,11 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db missing rollout path for thread",
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
 ];
-const CODEX_APP_SERVER_FORCE_KILL_AFTER = "2 seconds" as const;
+const CODEX_APP_SERVER_FORCE_KILL_AFTER = "5 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_HOOK_TIMEOUT = "2 seconds" as const;
+const CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT = "3 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_HOOK_MAX_OUTPUT_BYTES = 8 * 1024;
-const encodeCollabLifecycleHookPayload = Schema.encodeSync(
-  Schema.fromJsonString(Schema.Unknown),
-);
+const encodeCollabLifecycleHookPayload = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -221,7 +229,7 @@ export interface CodexSessionRuntimeShape {
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly events: Stream.Stream<ProviderEvent, never>;
-  readonly close: Effect.Effect<void>;
+  readonly close: Effect.Effect<void, CodexSessionRuntimeCloseError>;
 }
 
 export type CodexSessionRuntimeError =
@@ -230,6 +238,19 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
   | CodexSessionRuntimeThreadIdMissingError;
+
+export class CodexSessionRuntimeCloseError extends Schema.TaggedErrorClass<CodexSessionRuntimeCloseError>()(
+  "CodexSessionRuntimeCloseError",
+  {
+    threadId: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Codex provider process did not close safely for ${this.threadId}: ${this.detail}`;
+  }
+}
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
   "CodexSessionRuntimePendingApprovalNotFoundError",
@@ -660,6 +681,9 @@ function classifyCodexStderrLine(rawLine: string): { readonly message: string } 
   if (!line) {
     return null;
   }
+  if (line.startsWith(CODEX_PROVIDER_GUARDIAN_LOG_PREFIX)) {
+    return null;
+  }
 
   const match = line.match(CODEX_STDERR_LOG_REGEX);
   if (match) {
@@ -675,7 +699,25 @@ function classifyCodexStderrLine(rawLine: string): { readonly message: string } 
   return { message: line };
 }
 
+export function isCodexActiveWriterError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as {
+    readonly _tag?: unknown;
+    readonly code?: unknown;
+    readonly errorMessage?: unknown;
+  };
+  return (
+    candidate._tag === "CodexAppServerRequestError" &&
+    candidate.code === -32600 &&
+    typeof candidate.errorMessage === "string" &&
+    /\bthread\b.+\balready has an active writer\b/i.test(candidate.errorMessage)
+  );
+}
+
 export function isRecoverableThreadResumeError(error: unknown): boolean {
+  if (isCodexActiveWriterError(error)) {
+    return false;
+  }
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   if (!message.includes("thread")) {
     return false;
@@ -1134,6 +1176,8 @@ export const makeCodexSessionRuntime = (
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
+    const hostPlatform = yield* HostProcessPlatform;
+    const hostExecutablePath = yield* HostProcessExecutablePath;
     const events = yield* Queue.unbounded<ProviderEvent>();
     const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
@@ -1169,14 +1213,33 @@ export const makeCodexSessionRuntime = (
       env,
       extendEnv,
     });
+    const guardianEntryPath = resolveCodexProviderGuardianEntry(import.meta.url);
+    const guardedSpawnCommand =
+      hostPlatform === "win32"
+        ? { ...spawnCommand, env }
+        : {
+            command: hostExecutablePath,
+            args: resolveCodexProviderGuardianRuntimeArgs(guardianEntryPath),
+            shell: false,
+            env: {
+              ...env,
+              [CODEX_PROVIDER_GUARDIAN_SPEC_ENV]: encodeCodexProviderGuardianSpec({
+                command: spawnCommand.command,
+                args: spawnCommand.args,
+                cwd: options.cwd,
+                shell: spawnCommand.shell,
+                parentPid: process.pid,
+              }),
+            },
+          };
     const child = yield* spawner
       .spawn(
-        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+        ChildProcess.make(guardedSpawnCommand.command, guardedSpawnCommand.args, {
           cwd: options.cwd,
-          env,
+          env: guardedSpawnCommand.env,
           extendEnv,
           forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
-          shell: spawnCommand.shell,
+          shell: guardedSpawnCommand.shell,
         }),
       )
       .pipe(
@@ -1352,15 +1415,15 @@ export const makeCodexSessionRuntime = (
           new CodexCollabLifecycleBridge(item.senderThreadId);
         yield* Ref.set(collabLifecycleBridgeRef, bridge);
         const lifecyclePayloads = bridge.observeToolCall({
-            id: item.id,
-            tool: item.tool,
-            prompt: item.prompt,
-            ...(typeof item.model === "string" ? { model: item.model } : {}),
-            ...(typeof item.reasoningEffort === "string"
-              ? { reasoningEffort: item.reasoningEffort }
-              : {}),
-            receiverThreadIds: item.receiverThreadIds,
-          });
+          id: item.id,
+          tool: item.tool,
+          prompt: item.prompt,
+          ...(typeof item.model === "string" ? { model: item.model } : {}),
+          ...(typeof item.reasoningEffort === "string"
+            ? { reasoningEffort: item.reasoningEffort }
+            : {}),
+          receiverThreadIds: item.receiverThreadIds,
+        });
         const exactReceiver =
           item.receiverThreadIds.length === 1 ? item.receiverThreadIds[0] : undefined;
         const registeredRole = exactReceiver
@@ -1382,9 +1445,7 @@ export const makeCodexSessionRuntime = (
       Ref.get(collabLifecycleBridgeRef).pipe(
         Effect.flatMap((bridge) =>
           bridge
-            ? deliverCollabLifecycleHooks(
-                bridge.observeChildTerminal(agentId, status, agentType),
-              )
+            ? deliverCollabLifecycleHooks(bridge.observeChildTerminal(agentId, status, agentType))
             : Effect.void,
         ),
       );
@@ -1589,11 +1650,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "completed",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "completed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1651,11 +1708,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "cancelled",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "cancelled", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1682,11 +1735,7 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(
-              child.agentThreadId,
-              "failed",
-              child.role,
-            );
+            yield* observeCollabLifecycleTerminal(child.agentThreadId, "failed", child.role);
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -2257,20 +2306,63 @@ export const makeCodexSessionRuntime = (
     });
 
     const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
+      const alreadyClosed = yield* Ref.get(closedRef);
       if (alreadyClosed) {
         return;
       }
-      yield* deliverCollabLifecycleHooks([]);
+      const lifecycleBridge = yield* Ref.get(collabLifecycleBridgeRef);
+      const lifecycleChildren = yield* Ref.get(collabChildAgentsRef);
+      const closePayloads = lifecycleBridge
+        ? lifecycleBridge.observeSessionClose(
+            [...lifecycleChildren.values()].map((child) => ({
+              agentId: child.agentThreadId,
+              ...(child.role ? { agentType: child.role } : {}),
+            })),
+          )
+        : [];
+      yield* deliverCollabLifecycleHooks(closePayloads).pipe(
+        Effect.timeout(CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT),
+        Effect.ignore,
+      );
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
+      const guardianExitCode = yield* child
+        .kill({
+          killSignal: "SIGTERM",
+          forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
+        })
+        .pipe(
+          Effect.andThen(child.exitCode),
+          Effect.timeout("6 seconds"),
+          Effect.mapError(
+            (cause) =>
+              new CodexSessionRuntimeCloseError({
+                threadId: options.threadId,
+                detail: "guardian exit was not observed within the shutdown budget",
+                cause,
+              }),
+          ),
+        );
+      if (
+        hostPlatform !== "win32" &&
+        Number(guardianExitCode) === CODEX_PROVIDER_GUARDIAN_FAILURE_EXIT_CODE
+      ) {
+        return yield* new CodexSessionRuntimeCloseError({
+          threadId: options.threadId,
+          detail: "the Codex process group survived guardian escalation",
+        });
+      }
+      yield* Ref.set(closedRef, true);
       yield* updateSession(sessionRef, {
         status: "closed",
         activeTurnId: undefined,
       });
       yield* emitSessionEvent("session/closed", "Session stopped").pipe(
         Effect.catch((cause) =>
-          Effect.logError("Failed to emit Codex session closed event.", { cause }),
+          Effect.logError("Failed to emit Codex session closed event.", {
+            threadId: options.threadId,
+            cause,
+          }),
         ),
       );
       yield* Scope.close(runtimeScope, Exit.void);

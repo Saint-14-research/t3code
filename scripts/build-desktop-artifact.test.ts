@@ -13,10 +13,13 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import {
   BundleNotSelfContainedError,
   BuildCommandFailedError,
+  copyDesktopBuildArtifact,
+  DesktopBuildArtifactOutputExistsError,
   DesktopDmgBackgroundSourceMissingError,
   createStageWorkspaceConfig,
   createStagePatchedDependencies,
   createBuildConfig,
+  encodeMacIcns,
   DESKTOP_ELECTRON_LANGUAGES,
   DESKTOP_FILE_EXCLUSIONS,
   DESKTOP_EXTRA_RESOURCES,
@@ -153,6 +156,58 @@ const makeWindowsPayloadFixture = Effect.fn("test.makeWindowsPayloadFixture")(fu
 });
 
 it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
+  it.effect("refuses to merge a directory artifact into existing output", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-artifact-copy-" });
+      const source = path.join(root, "source.app");
+      const destination = path.join(root, "output.app");
+      yield* fs.makeDirectory(source, { recursive: true });
+      yield* fs.writeFileString(path.join(source, "current.txt"), "current");
+
+      yield* copyDesktopBuildArtifact({
+        sourcePath: source,
+        destinationPath: destination,
+        directory: true,
+      });
+      assert.equal(yield* fs.readFileString(path.join(destination, "current.txt")), "current");
+
+      yield* fs.writeFileString(path.join(destination, "stale.txt"), "stale");
+      const error = yield* Effect.flip(
+        copyDesktopBuildArtifact({
+          sourcePath: source,
+          destinationPath: destination,
+          directory: true,
+        }),
+      );
+      assert.instanceOf(error, DesktopBuildArtifactOutputExistsError);
+      assert.equal(yield* fs.readFileString(path.join(destination, "stale.txt")), "stale");
+    }).pipe(Effect.scoped),
+  );
+
+  it("encodes deterministic ICNS containers without relying on iconutil", () => {
+    const encoded = Buffer.from(
+      encodeMacIcns([
+        { type: "icp4", data: Uint8Array.from([1, 2]) },
+        { type: "ic10", data: Uint8Array.from([3, 4, 5]) },
+      ]),
+    );
+
+    assert.equal(encoded.subarray(0, 4).toString("ascii"), "icns");
+    assert.equal(encoded.readUInt32BE(4), encoded.byteLength);
+    assert.equal(encoded.subarray(8, 12).toString("ascii"), "icp4");
+    assert.equal(encoded.readUInt32BE(12), 10);
+    assert.deepStrictEqual([...encoded.subarray(16, 18)], [1, 2]);
+    assert.equal(encoded.subarray(18, 22).toString("ascii"), "ic10");
+    assert.equal(encoded.readUInt32BE(22), 11);
+    assert.deepStrictEqual([...encoded.subarray(26)], [3, 4, 5]);
+  });
+
+  it("rejects malformed ICNS entry types", () => {
+    assert.throws(() => encodeMacIcns([{ type: "bad", data: new Uint8Array() }]));
+  });
+
   it("resolves the dedicated nightly updater channel from nightly versions", () => {
     assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42"), "nightly");
     assert.equal(resolveDesktopUpdateChannel("0.0.17"), "latest");

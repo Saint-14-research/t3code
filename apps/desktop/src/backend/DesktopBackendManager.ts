@@ -63,7 +63,10 @@ const MAX_PREFLIGHT_FAILURE_ATTEMPTS = 5;
 const DEFAULT_BACKEND_READINESS_TIMEOUT = Duration.minutes(1);
 const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
-const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(2);
+const DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL = Duration.seconds(5);
+const DEFAULT_BACKEND_HEALTH_CHECK_TIMEOUT = Duration.seconds(2);
+const DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_LIMIT = 3;
+const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(8);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
 const { logWarning: logBackendProcessWarning } =
@@ -221,11 +224,19 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
   readonly readinessTimeout?: Duration.Duration;
+  readonly healthCheckInterval?: Duration.Duration;
+  readonly healthCheckTimeout?: Duration.Duration;
+  readonly healthCheckFailureLimit?: number;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
   readonly onExitObserved?: () => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
   readonly onReadinessFailure?: (error: BackendReadinessTimeoutError) => Effect.Effect<void>;
+  readonly onHealthCheckFailure?: (
+    error: BackendReadinessTimeoutError,
+    consecutiveFailures: number,
+    failureLimit: number,
+  ) => Effect.Effect<void>;
   readonly onOutput?: (
     streamName: BackendProcessOutputStream,
     chunk: Uint8Array,
@@ -588,7 +599,61 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
     ),
   );
 
-  yield* probeReadiness().pipe(Effect.repeat({ while: (ready) => !ready }), Effect.forkScoped);
+  yield* Effect.gen(function* () {
+    yield* probeReadiness().pipe(Effect.repeat({ while: (ready) => !ready }));
+
+    const healthCheckInterval =
+      options.healthCheckInterval ?? DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL;
+    const healthCheckTimeout = options.healthCheckTimeout ?? DEFAULT_BACKEND_HEALTH_CHECK_TIMEOUT;
+    const failureLimit = Math.max(
+      1,
+      Math.floor(options.healthCheckFailureLimit ?? DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_LIMIT),
+    );
+    let consecutiveFailures = 0;
+
+    while (true) {
+      yield* Effect.sleep(healthCheckInterval);
+      const result = yield* waitForHttpReady({
+        executablePath: options.executablePath,
+        entryPath: options.entryPath,
+        cwd: options.cwd,
+        httpBaseUrl: options.httpBaseUrl,
+        timeout: healthCheckTimeout,
+      }).pipe(
+        Effect.as({ healthy: true } as const),
+        Effect.catchTag("BackendReadinessTimeoutError", (error) =>
+          Effect.succeed({ healthy: false, error } as const),
+        ),
+      );
+
+      if (result.healthy) {
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      consecutiveFailures += 1;
+      yield* (
+        options.onHealthCheckFailure?.(result.error, consecutiveFailures, failureLimit) ??
+          Effect.void
+      );
+      if (consecutiveFailures < failureLimit) {
+        continue;
+      }
+
+      const killed = yield* handle.kill({ killSignal: "SIGKILL", forceKillAfter: 1_000 }).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          logBackendProcessWarning("failed to terminate unresponsive desktop backend", {
+            pid: Number(handle.pid),
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(false)),
+        ),
+      );
+      if (killed) {
+        return;
+      }
+    }
+  }).pipe(Effect.forkScoped);
 
   const exit = yield* handle.exitCode.pipe(
     Effect.mapError(
@@ -948,6 +1013,20 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               yield* backendOutputLog.persistFailureSnapshot({
                 details: error.message,
               });
+            },
+          ),
+          onHealthCheckFailure: Effect.fn("desktop.backendInstance.onHealthCheckFailure")(
+            function* (error, consecutiveFailures, failureLimit) {
+              yield* logInstanceWarning("backend health check failed after readiness", {
+                error: error.message,
+                consecutiveFailures,
+                failureLimit,
+              });
+              if (consecutiveFailures === failureLimit) {
+                yield* backendOutputLog.persistFailureSnapshot({
+                  details: `${error.message} consecutiveFailures=${consecutiveFailures} failureLimit=${failureLimit}`,
+                });
+              }
             },
           ),
           onOutput: (streamName, chunk) => backendOutputLog.writeOutputChunk(streamName, chunk),

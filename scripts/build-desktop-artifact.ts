@@ -518,6 +518,62 @@ export class DesktopBuildNoArtifactsProducedError extends Schema.TaggedErrorClas
   }
 }
 
+export class DesktopBuildArtifactCopyError extends Schema.TaggedErrorClass<DesktopBuildArtifactCopyError>()(
+  "DesktopBuildArtifactCopyError",
+  {
+    sourcePath: Schema.String,
+    destinationPath: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Failed to copy desktop build artifact from ${this.sourcePath} to ${this.destinationPath}.`;
+  }
+}
+
+export class DesktopBuildArtifactOutputExistsError extends Schema.TaggedErrorClass<DesktopBuildArtifactOutputExistsError>()(
+  "DesktopBuildArtifactOutputExistsError",
+  {
+    destinationPath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Refusing to merge a desktop build artifact into existing output at ${this.destinationPath}. Use a fresh output directory.`;
+  }
+}
+
+export const copyDesktopBuildArtifact = Effect.fn("copyDesktopBuildArtifact")(function* (input: {
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+  readonly directory: boolean;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  if (yield* fs.exists(input.destinationPath)) {
+    return yield* new DesktopBuildArtifactOutputExistsError({
+      destinationPath: input.destinationPath,
+    });
+  }
+
+  if (!input.directory) {
+    yield* fs.copyFile(input.sourcePath, input.destinationPath);
+    return;
+  }
+
+  yield* Effect.tryPromise({
+    try: () =>
+      NodeFSP.cp(input.sourcePath, input.destinationPath, {
+        recursive: true,
+        verbatimSymlinks: true,
+      }),
+    catch: (cause) =>
+      new DesktopBuildArtifactCopyError({
+        sourcePath: input.sourcePath,
+        destinationPath: input.destinationPath,
+        cause,
+      }),
+  });
+});
+
 export class WslNodePtyPrebuildMissingError extends Schema.TaggedErrorClass<WslNodePtyPrebuildMissingError>()(
   "WslNodePtyPrebuildMissingError",
   {
@@ -1768,32 +1824,48 @@ function generateMacIconSet(
 ) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
-    const iconsetDir = path.join(tmpRoot, "icon.iconset");
-    yield* fs.makeDirectory(iconsetDir, { recursive: true });
-
-    const iconSizes = [16, 32, 128, 256, 512] as const;
-    for (const size of iconSizes) {
+    const iconEntries = [
+      { type: "icp4", size: 16 },
+      { type: "icp5", size: 32 },
+      { type: "icp6", size: 64 },
+      { type: "ic07", size: 128 },
+      { type: "ic08", size: 256 },
+      { type: "ic09", size: 512 },
+      { type: "ic10", size: 1024 },
+    ] as const;
+    const encodedEntries: Array<{ readonly type: string; readonly data: Uint8Array }> = [];
+    for (const entry of iconEntries) {
+      const pngPath = path.join(tmpRoot, `${entry.type}.png`);
       yield* runCommand(
-        ChildProcess.make(
-          {},
-        )`sips -z ${size} ${size} ${sourcePng} --out ${path.join(iconsetDir, `icon_${size}x${size}.png`)}`,
-        { label: `sips icon ${size}x${size}`, verbose },
+        ChildProcess.make({})`sips -z ${entry.size} ${entry.size} ${sourcePng} --out ${pngPath}`,
+        { label: `sips icon ${entry.size}x${entry.size}`, verbose },
       );
-
-      const retinaSize = size * 2;
-      yield* runCommand(
-        ChildProcess.make(
-          {},
-        )`sips -z ${retinaSize} ${retinaSize} ${sourcePng} --out ${path.join(iconsetDir, `icon_${size}x${size}@2x.png`)}`,
-        { label: `sips icon ${size}x${size}@2x`, verbose },
-      );
+      encodedEntries.push({ type: entry.type, data: yield* fs.readFile(pngPath) });
     }
-
-    yield* runCommand(ChildProcess.make({})`iconutil -c icns ${iconsetDir} -o ${targetIcns}`, {
-      label: "iconutil icns",
-      verbose,
-    });
+    yield* fs.writeFile(targetIcns, encodeMacIcns(encodedEntries));
   });
+}
+
+export function encodeMacIcns(
+  entries: ReadonlyArray<{ readonly type: string; readonly data: Uint8Array }>,
+): Uint8Array {
+  const entryLength = entries.reduce((total, entry) => total + 8 + entry.data.byteLength, 0);
+  const output = Buffer.allocUnsafe(8 + entryLength);
+  output.write("icns", 0, 4, "ascii");
+  output.writeUInt32BE(output.byteLength, 4);
+
+  let offset = 8;
+  for (const entry of entries) {
+    if (!/^[\x20-\x7e]{4}$/u.test(entry.type)) {
+      throw new Error(`Invalid ICNS entry type '${entry.type}'.`);
+    }
+    output.write(entry.type, offset, 4, "ascii");
+    output.writeUInt32BE(8 + entry.data.byteLength, offset + 4);
+    output.set(entry.data, offset + 8);
+    offset += 8 + entry.data.byteLength;
+  }
+
+  return output;
 }
 
 function stageMacIcons(stageResourcesDir: string, sourcePng: string, verbose: boolean) {
@@ -3142,11 +3214,24 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   for (const entry of stageEntries) {
     const from = path.join(stageDistDir, entry);
     const stat = yield* fs.stat(from).pipe(Effect.orElseSucceed(() => null));
-    if (!stat || stat.type !== "File") continue;
+    if (!stat) continue;
 
     const to = path.join(options.outputDir, entry);
-    yield* fs.copyFile(from, to);
-    copiedArtifacts.push(to);
+    if (stat.type === "File") {
+      yield* copyDesktopBuildArtifact({
+        sourcePath: from,
+        destinationPath: to,
+        directory: false,
+      });
+      copiedArtifacts.push(to);
+    } else if (options.target === "dir" && stat.type === "Directory") {
+      yield* copyDesktopBuildArtifact({
+        sourcePath: from,
+        destinationPath: to,
+        directory: true,
+      });
+      copiedArtifacts.push(to);
+    }
   }
 
   if (copiedArtifacts.length === 0) {

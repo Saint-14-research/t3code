@@ -24,6 +24,8 @@ import {
 import { decodeServicePreflightResult } from "./servicePreflight.ts";
 import * as ServiceLauncherClient from "./serviceLauncherClient.ts";
 import { isExactServiceVersion, SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { isProviderThreadBusy } from "../provider/threadBusy.ts";
 
 const PREFLIGHT_TIMEOUT = Duration.seconds(30);
 
@@ -45,7 +47,13 @@ export class ServerSelfUpdate extends Context.Service<
   }
 >()("t3/cloud/selfUpdate/ServerSelfUpdate") {}
 
-export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+export interface ServerSelfUpdateMakeOptions {
+  readonly readBusyThreadTitles?: () => Effect.Effect<ReadonlyArray<string>, ServerSelfUpdateError>;
+}
+
+export const make = Effect.fn("cloud.server_self_update.make")(function* (
+  options: ServerSelfUpdateMakeOptions = {},
+) {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
   const runner = yield* ProcessRunner.ProcessRunner;
@@ -53,6 +61,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const path = yield* Path.Path;
   const execPath = yield* HostProcessExecutablePath;
   const inFlight = yield* Ref.make(false);
+  const readBusyThreadTitles = options.readBusyThreadTitles ?? (() => Effect.succeed([]));
 
   const capability: ServerSelfUpdateCapability | null =
     serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
@@ -78,6 +87,12 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     const targetVersion = input.targetVersion.trim();
     if (!isExactServiceVersion(targetVersion)) {
       return yield* failWith(`'${targetVersion}' is not an exact t3 version.`);
+    }
+    const busyThreadTitles = yield* readBusyThreadTitles();
+    if (busyThreadTitles.length > 0) {
+      return yield* failWith(
+        `Update paused because ${String(busyThreadTitles.length)} T3 Code task${busyThreadTitles.length === 1 ? " is" : "s are"} still active. Finish or stop active work, then retry the update.`,
+      );
     }
     if (yield* Ref.getAndSet(inFlight, true)) {
       return yield* failWith("A server update is already in progress.");
@@ -194,6 +209,24 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   return ServerSelfUpdate.of({ update });
 });
 
-export const layer = Layer.effect(ServerSelfUpdate, make()).pipe(
-  Layer.provide(ProcessRunner.layer),
-);
+export const layer = Layer.effect(
+  ServerSelfUpdate,
+  Effect.gen(function* () {
+    const query = yield* ProjectionSnapshotQuery;
+    return yield* make({
+      readBusyThreadTitles: () =>
+        query.getCommandReadModel().pipe(
+          Effect.map(({ threads }) =>
+            threads.filter(isProviderThreadBusy).map((thread) => thread.title),
+          ),
+          Effect.mapError(
+            (cause) =>
+              new ServerSelfUpdateError({
+                reason: "Could not verify that active work is idle.",
+                cause,
+              }),
+          ),
+        ),
+    });
+  }),
+).pipe(Layer.provide(ProcessRunner.layer));

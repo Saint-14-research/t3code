@@ -90,16 +90,15 @@ export class CodexCollabLifecycleBridge {
   readonly sessionId: string;
   readonly #attemptsByToolUseId = new Map<string, Attempt>();
   readonly #attemptsByAgentId = new Map<string, Attempt>();
-  readonly #terminalAgentStatuses = new Map<
-    string,
-    "completed" | "cancelled" | "failed"
-  >();
+  readonly #terminalAgentStatuses = new Map<string, "completed" | "cancelled" | "failed">();
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
   }
 
-  observeToolCall(call: CodexCollabLifecycleToolCall): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+  observeToolCall(
+    call: CodexCollabLifecycleToolCall,
+  ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
     const existing = this.#attemptsByToolUseId.get(call.id);
     if (existing) {
       return this.#bind(existing, call.receiverThreadIds);
@@ -152,6 +151,18 @@ export class CodexCollabLifecycleBridge {
     }
     attempt.agentType = nonEmptyString(agentType) ?? "unknown";
     return this.#startAndMaybeStop(attempt, agentId);
+  }
+
+  observeSessionClose(
+    children: ReadonlyArray<{
+      readonly agentId: string;
+      readonly agentType?: string | undefined;
+    }>,
+  ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+    const agentTypes = new Map(children.map((child) => [child.agentId, child.agentType]));
+    return [...this.#attemptsByAgentId.keys()].flatMap((agentId) =>
+      this.observeChildTerminal(agentId, "cancelled", agentTypes.get(agentId)),
+    );
   }
 
   #bind(attempt: Attempt, receiverThreadIds: ReadonlyArray<string>) {

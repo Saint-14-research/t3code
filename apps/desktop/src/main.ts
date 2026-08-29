@@ -105,6 +105,9 @@ const resolveDesktopSshCliRunner = (
           desktopCli: {
             executablePath: `${remoteDesktopAppContents}/MacOS/${environment.displayName}`,
             entryPath: `${remoteDesktopAppContents}/Resources/app.asar/apps/server/dist/bin.mjs`,
+            fallbackExecutablePath: "/Applications/T3i Code.app/Contents/MacOS/T3 Code (Alpha)",
+            fallbackEntryPath:
+              "/Applications/T3i Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
             version: environment.appVersion,
           },
         }
