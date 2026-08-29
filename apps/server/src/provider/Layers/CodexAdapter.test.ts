@@ -23,6 +23,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -41,12 +42,13 @@ import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
+  CodexSessionRuntimeCloseError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
-import { makeCodexAdapter } from "./CodexAdapter.ts";
+import { makeCodexAdapter, mapCodexStartError } from "./CodexAdapter.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -58,6 +60,19 @@ const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
 const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
+
+it("maps an exact active-writer response to an actionable request error", () => {
+  const error = mapCodexStartError(
+    asThreadId("thread-writer-conflict"),
+    new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage: "thread provider-thread-1 already has an active writer",
+    }),
+  );
+  NodeAssert.equal(error._tag, "ProviderAdapterRequestError");
+  NodeAssert.match(error.message, /still open in another Codex process/);
+  NodeAssert.doesNotMatch(error.message, /ProviderAdapterProcessError/);
+});
 
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
   private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
@@ -162,7 +177,15 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Stream.fromQueue(this.eventQueue);
   }
 
-  close = Effect.promise(() => this.closeImpl());
+  close = Effect.tryPromise({
+    try: () => this.closeImpl(),
+    catch: (cause) =>
+      new CodexSessionRuntimeCloseError({
+        threadId: this.options.threadId,
+        detail: "test close failure",
+        cause,
+      }),
+  });
 
   emit(event: ProviderEvent) {
     return Queue.offer(this.eventQueue, event).pipe(Effect.asVoid);
@@ -185,7 +208,10 @@ function makeRuntimeFactory() {
   };
 }
 
-function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolean }) {
+function makeScopedRuntimeFactory(options?: {
+  readonly failConstruction?: boolean;
+  readonly configureRuntime?: (runtime: FakeCodexRuntime, index: number) => void;
+}) {
   const runtimes: Array<FakeCodexRuntime> = [];
   const releasedThreadIds: Array<ThreadId> = [];
 
@@ -206,6 +232,7 @@ function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolea
       }
 
       const runtime = new FakeCodexRuntime(runtimeOptions);
+      options?.configureRuntime?.(runtime, runtimes.length);
       runtimes.push(runtime);
       return runtime;
     }),
@@ -1571,6 +1598,93 @@ scopedLifecycleLayer("CodexAdapterLive scoped lifecycle", (it) => {
         asThreadId("thread-stop"),
       ]);
       NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-stop")), false);
+    }),
+  );
+
+  it.effect("fails replacement but releases local ownership when close reports failure", () =>
+    Effect.gen(function* () {
+      scopedLifecycleRuntimeFactory.releasedThreadIds.length = 0;
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("thread-close-failure");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const runtime = scopedLifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const runtimeCount = scopedLifecycleRuntimeFactory.factory.mock.calls.length;
+      runtime.closeImpl.mockRejectedValueOnce(new Error("child group survived"));
+
+      const failure = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(failure._tag, "ProviderAdapterProcessError");
+      NodeAssert.equal(scopedLifecycleRuntimeFactory.factory.mock.calls.length, runtimeCount);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      NodeAssert.deepStrictEqual(scopedLifecycleRuntimeFactory.releasedThreadIds, [threadId]);
+    }),
+  );
+});
+
+// oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- module-scoped one-shot gates configure the single shared test layer before it is built.
+const singleFlightStartEntered = Effect.runSync(Deferred.make<void>());
+// oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- paired with the entry gate above; no test effect is executed here.
+const singleFlightStartRelease = Effect.runSync(Deferred.make<void>());
+const singleFlightRuntimeFactory = makeScopedRuntimeFactory({
+  configureRuntime: (runtime, index) => {
+    if (index !== 0) return;
+    runtime.start = () =>
+      Deferred.succeed(singleFlightStartEntered, undefined).pipe(
+        Effect.andThen(Deferred.await(singleFlightStartRelease)),
+        Effect.andThen(Effect.promise(() => runtime.startImpl())),
+      );
+  },
+});
+const singleFlightLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const codexConfig = decodeCodexSettings({});
+      return yield* makeCodexAdapter(codexConfig, {
+        makeRuntime: singleFlightRuntimeFactory.factory,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+singleFlightLayer("CodexAdapterLive start single-flight", (it) => {
+  it.effect("never overlaps two starts for the same task", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const input = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-single-flight"),
+        runtimeMode: "full-access" as const,
+      };
+      const first = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Deferred.await(singleFlightStartEntered);
+      const second = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      NodeAssert.equal(singleFlightRuntimeFactory.factory.mock.calls.length, 1);
+
+      yield* Deferred.succeed(singleFlightStartRelease, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      NodeAssert.equal(singleFlightRuntimeFactory.factory.mock.calls.length, 2);
+      NodeAssert.equal(yield* adapter.hasSession(input.threadId), true);
     }),
   );
 });

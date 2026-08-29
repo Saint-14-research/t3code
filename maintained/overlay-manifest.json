@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "officialRepository": "https://github.com/pingdotgg/t3code.git",
+  "reviewedThrough": {
+    "tag": "v0.0.36",
+    "commit": "8fc7f22941969d7a2c06929dc29aa86ae1b02f33",
+    "reviewedAt": "2026-08-29",
+    "reviewers": ["Codex", "Claude Fable 5 High"]
+  },
+  "productPatchCommits": [
+    "c33e362fa9616f4c72f98974a092c71cb7fd5969",
+    "32cf9b96e997a495e6a57b58b8db17e5fafa7385",
+    "289fa82560b371fe3a10f9d5724d33f9bff0384c",
+    "3174fde2a80c3d2c55e9882c7f8739d707519a55"
+  ],
+  "topology": {
+    "miniLaunchOwner": "desktop-app",
+    "remoteTransport": "t3-connect-relay",
+    "optionalDirectTransport": "tailscale-https-bearer",
+    "disallowedConcurrentOwners": ["background-service", "ssh-launched-server", "npx-serve"]
+  },
+  "signing": {
+    "officialAppleSignatureRequiresUnmodifiedOfficialBundle": true,
+    "customArtifactPolicy": "unsigned-or-owner-developer-id",
+    "officialSigningPath": "upstream acceptance followed by an official T3 Code release"
+  },
+  "features": [
+    {
+      "id": "desktop-backend-watchdog",
+      "decision": "retain",
+      "intent": "Restart a desktop backend that stays unhealthy after readiness without creating a second launch owner.",
+      "retentionCondition": "Retain until upstream has a bounded post-readiness health monitor with graceful termination and restart coverage.",
+      "reviewPaths": [
+        "apps/desktop/src/backend/DesktopBackendManager.ts",
+        "apps/desktop/src/backend/DesktopBackendManager.test.ts"
+      ],
+      "requiredEvidence": [
+        {
+          "path": "apps/desktop/src/backend/DesktopBackendManager.ts",
+          "contains": "probeReadiness"
+        }
+      ],
+      "upstreamEquivalentEvidence": [
+        {
+          "path": "apps/desktop/src/backend/DesktopBackendManager.ts",
+          "contains": "DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL"
+        },
+        {
+          "path": "apps/desktop/src/backend/DesktopBackendManager.test.ts",
+          "contains": "terminates a backend that stops serving after it was ready"
+        }
+      ],
+      "verify": [
+        "vp test apps/desktop/src/backend/DesktopBackendManager.test.ts",
+        "vp run --filter ./apps/desktop typecheck"
+      ]
+    },
+    {
+      "id": "codex-process-lifecycle-guardian",
+      "decision": "retain",
+      "intent": "Tie each Codex app-server process group to its T3 owner and release writer ownership after crashes or broken transport pipes.",
+      "retentionCondition": "Retain until upstream proves abrupt-parent-death cleanup, descendant cleanup, and real writer-lock reacquisition.",
+      "reviewPaths": [
+        "apps/server/package.json",
+        "apps/server/src/provider/Layers/CodexSessionRuntime.ts",
+        "apps/server/src/provider/Layers/CodexAdapter.ts"
+      ],
+      "requiredEvidence": [
+        {
+          "path": "apps/server/src/provider/Layers/CodexSessionRuntime.ts",
+          "contains": "ChildProcessSpawner.ChildProcessSpawner"
+        },
+        {
+          "path": "apps/server/src/provider/Layers/CodexAdapter.ts",
+          "contains": "startSession"
+        }
+      ],
+      "upstreamEquivalentEvidence": [
+        {
+          "path": "apps/server/src/providerGuardian.ts",
+          "contains": "CODEX_PROVIDER_GUARDIAN_SPEC_ENV"
+        },
+        {
+          "path": "apps/server/src/providerGuardian.test.ts",
+          "contains": "releases a real OS advisory writer lock after abrupt parent death"
+        }
+      ],
+      "reverifyOnChange": [
+        "effect-codex-app-server dependency",
+        "Codex active-writer protocol error text",
+        "provider process spawn or close contract"
+      ],
+      "verify": [
+        "vp test apps/server/src/providerGuardian.test.ts apps/server/src/provider/Layers/CodexSessionRuntime.test.ts apps/server/src/provider/Layers/CodexAdapter.test.ts",
+        "vp run --filter ./apps/server typecheck"
+      ]
+    },
+    {
+      "id": "single-authoritative-mini-backend",
+      "decision": "native-configuration",
+      "intent": "Keep the Mini desktop backend as the only launch owner while the Air connects through the official T3 Connect relay, with Tailscale HTTPS bearer pairing as an optional direct fallback.",
+      "retentionCondition": "Keep as configuration policy; do not restore the retired SSH-launch source patch or select an SSH connection as the normal Air transport.",
+      "reviewPaths": [
+        "packages/client-runtime/src/connection/resolver.ts",
+        "apps/server/src/cloud/http.ts",
+        "apps/desktop/src/backend/DesktopServerExposure.ts"
+      ],
+      "requiredEvidence": [
+        {
+          "path": "packages/client-runtime/src/connection/resolver.ts",
+          "contains": "RelayConnectionTarget"
+        },
+        {
+          "path": "apps/server/src/cloud/http.ts",
+          "contains": "reconcileDesiredCloudLink"
+        }
+      ],
+      "upstreamEquivalentEvidence": [],
+      "verify": [
+        "Mini process inventory shows one desktop-owned T3 server",
+        "Air stores the Mini as a RelayConnectionTarget and opens a relay WebSocket without SSH launching a server",
+        "If the optional direct path is used, Air connects to the Mini Tailscale HTTPS endpoint through bearer pairing"
+      ]
+    },
+    {
+      "id": "active-work-update-gate",
+      "decision": "retain",
+      "intent": "Refuse a background-service restart while provider work is active, including a second check immediately before launcher handoff.",
+      "retentionCondition": "Retain until upstream has an equivalent fail-closed two-phase active-work gate.",
+      "reviewPaths": [
+        "apps/server/src/cloud/selfUpdate.ts",
+        "apps/server/src/provider/Layers/ProviderSessionReaper.ts",
+        "apps/server/src/orchestration/Services/ProjectionSnapshotQuery.ts"
+      ],
+      "requiredEvidence": [
+        {
+          "path": "apps/server/src/cloud/selfUpdate.ts",
+          "contains": "requestUpdate({ targetVersion"
+        }
+      ],
+      "upstreamEquivalentEvidence": [
+        {
+          "path": "apps/server/src/cloud/selfUpdate.ts",
+          "contains": "verifyProviderWorkIsIdle"
+        },
+        {
+          "path": "apps/server/src/provider/threadBusy.ts",
+          "contains": "isProviderThreadBusy"
+        }
+      ],
+      "verify": [
+        "vp test apps/server/src/cloud/selfUpdate.test.ts apps/server/src/provider/threadBusy.test.ts apps/server/src/provider/Layers/ProviderSessionReaper.test.ts",
+        "vp run --filter ./apps/server typecheck"
+      ]
+    }
+  ]
+}

@@ -1178,7 +1178,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
       ),
     ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
+    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll(), {
+      concurrency: "unbounded",
+    }).pipe(Effect.asVoid);
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));

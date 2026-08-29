@@ -16,15 +16,304 @@ import {
 } from "../CodexDeveloperInstructions.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
+  CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+  CodexCollabLifecycleBridge,
+  CodexCollabLifecycleDeliveryQueue,
+  parseCodexCollabLifecycleHookArgv,
+} from "./CodexCollabLifecycleBridge.ts";
+import {
   buildTurnStartParams,
   describeMcpElicitation,
   hasConfiguredMcpServer,
+  isCodexActiveWriterError,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
   openCodexThread,
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
+
+describe("CodexCollabLifecycleBridge", () => {
+  it("emits the native hook lifecycle once for one causally bound child", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const dispatched = bridge.observeToolCall({
+      id: "tool-call-1",
+      tool: "spawnAgent",
+      prompt: "Investigate the regression",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      receiverThreadIds: ["child-thread-1"],
+    });
+
+    NodeAssert.deepStrictEqual(dispatched, [
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "parent-thread",
+        tool_name: "spawn_agent",
+        tool_use_id: "tool-call-1",
+        tool_input: {
+          message: "Investigate the regression",
+          agent_type: "unknown",
+          model: "gpt-5.4",
+          reasoning_effort: "high",
+        },
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+    NodeAssert.deepStrictEqual(bridge.observeChildRole("child-thread-1", "reviewer"), [
+      {
+        hook_event_name: "SubagentStart",
+        session_id: "parent-thread",
+        agent_id: "child-thread-1",
+        agent_type: "reviewer",
+        tool_use_id: "tool-call-1",
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-1", "completed"), [
+      {
+        hook_event_name: "SubagentStop",
+        session_id: "parent-thread",
+        agent_id: "child-thread-1",
+        agent_type: "reviewer",
+        tool_use_id: "tool-call-1",
+        status: "completed",
+        consumer_surface: "t3-native-collaboration",
+        bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+      },
+    ]);
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-1", "completed"), []);
+  });
+
+  it("buffers a child terminal until one tool call has exactly one receiver", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const initial = {
+      id: "tool-call-2",
+      tool: "followupTask" as const,
+      prompt: "Run the narrow test",
+      receiverThreadIds: [],
+    };
+
+    NodeAssert.equal(bridge.observeToolCall(initial)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-thread-2", "failed"), []);
+    const bound = bridge.observeToolCall({ ...initial, receiverThreadIds: ["child-thread-2"] });
+
+    NodeAssert.deepStrictEqual(
+      bound.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "tool-call-2",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].tool_use_id : undefined,
+      "tool-call-2",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
+      "failed",
+    );
+  });
+
+  it("does not bind a multi-receiver call to an arbitrary child", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const payloads = bridge.observeToolCall({
+      id: "tool-call-3",
+      tool: "spawnAgent",
+      prompt: "Fan out",
+      receiverThreadIds: ["child-a", "child-b"],
+    });
+
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["PreToolUse"],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-a", "cancelled"), []);
+  });
+
+  it("binds a reused child's late followup terminal to the new attempt", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "initial-tool",
+      tool: "spawnAgent",
+      prompt: "Run the first task",
+      receiverThreadIds: ["reused-child"],
+    });
+    bridge.observeChildRole("reused-child", "reviewer");
+    bridge.observeChildTerminal("reused-child", "completed");
+
+    const followup = {
+      id: "followup-tool",
+      tool: "followupTask" as const,
+      prompt: "Run the followup",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(followup)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(bridge.observeChildRole("reused-child", "reviewer"), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeChildTerminal("reused-child", "completed", "reviewer"),
+      [],
+    );
+
+    const bound = bridge.observeToolCall({
+      ...followup,
+      receiverThreadIds: ["reused-child"],
+      status: "completed",
+    });
+    NodeAssert.deepStrictEqual(
+      bound.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "followup-tool",
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
+      "reviewer",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
+      "completed",
+    );
+  });
+
+  it("retires an unbound failed tool call and closes its session once", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const call = {
+      id: "failed-tool",
+      tool: "spawnAgent" as const,
+      prompt: "Try to spawn",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(call)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(
+      bridge.observeToolCall({ ...call, status: "failed" }).map((payload) => ({
+        event: payload.hook_event_name,
+        toolUseId: "tool_use_id" in payload ? payload.tool_use_id : undefined,
+      })),
+      [{ event: "PostToolUseFailure", toolUseId: "failed-tool" }],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeToolCall({ ...call, status: "failed" }), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([]).map((payload) => payload.hook_event_name),
+      ["SessionEnd"],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeSessionClose([]), []);
+  });
+
+  it("terminalizes registered active children when their session closes", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the session",
+      receiverThreadIds: ["active-child"],
+    });
+    bridge.observeChildRole("active-child", "reviewer");
+
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [
+        {
+          hook_event_name: "SubagentStop",
+          session_id: "parent-thread",
+          agent_id: "active-child",
+          agent_type: "reviewer",
+          tool_use_id: "close-tool",
+          status: "cancelled",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+        {
+          hook_event_name: "SessionEnd",
+          session_id: "parent-thread",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
+      ],
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([{ agentId: "active-child", agentType: "reviewer" }]),
+      [],
+    );
+  });
+
+  it("terminalizes a bound child when the session closes before child registration", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "early-close-tool",
+      tool: "spawnAgent",
+      prompt: "Observe the startup window",
+      receiverThreadIds: ["unregistered-child"],
+    });
+
+    const payloads = bridge.observeSessionClose([]);
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop", "SessionEnd"],
+    );
+    NodeAssert.equal(
+      payloads[0]?.hook_event_name === "SubagentStart" ? payloads[0].agent_type : undefined,
+      "unknown",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStop" ? payloads[1].status : undefined,
+      "cancelled",
+    );
+  });
+});
+
+describe("parseCodexCollabLifecycleHookArgv", () => {
+  it("accepts only a non-empty JSON argv array", () => {
+    NodeAssert.deepStrictEqual(
+      parseCodexCollabLifecycleHookArgv('["/usr/bin/python3", "-B", "/tmp/hook.py"]'),
+      ["/usr/bin/python3", "-B", "/tmp/hook.py"],
+    );
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv(undefined), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv("hook --unsafe"), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv("[]"), undefined);
+    NodeAssert.equal(parseCodexCollabLifecycleHookArgv('["hook", 1]'), undefined);
+    NodeAssert.equal(
+      CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
+      "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV",
+    );
+  });
+});
+
+describe("CodexCollabLifecycleDeliveryQueue", () => {
+  it("retains an unacknowledged hook and replays it before later events", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const queue = new CodexCollabLifecycleDeliveryQueue();
+    const preToolUse = bridge.observeToolCall({
+      id: "retry-tool",
+      tool: "spawnAgent",
+      prompt: "Bounded task",
+      receiverThreadIds: ["retry-child"],
+    });
+    const start = bridge.observeChildRole("retry-child", "worker");
+    queue.enqueue([...preToolUse, ...start]);
+
+    const failedDelivery = queue.peek();
+    NodeAssert.equal(failedDelivery?.hook_event_name, "PreToolUse");
+    NodeAssert.equal(queue.peek(), failedDelivery);
+    NodeAssert.equal(queue.size, 2);
+
+    queue.acknowledge(failedDelivery!);
+    NodeAssert.equal(queue.peek()?.hook_event_name, "SubagentStart");
+    NodeAssert.equal(queue.size, 1);
+  });
+});
 
 describe("CodexSessionRuntimeIdentifierGenerationError", () => {
   it("retains identifier purpose and the random source failure", () => {
@@ -752,6 +1041,33 @@ describe("isRecoverableThreadResumeError", () => {
     );
   });
 
+  it("classifies active writer only from the exact code and phrase", () => {
+    const exact = new CodexErrors.CodexAppServerRequestError({
+      code: -32600,
+      errorMessage: "thread 019f already has an active writer",
+    });
+    NodeAssert.equal(isCodexActiveWriterError(exact), true);
+    NodeAssert.equal(isRecoverableThreadResumeError(exact), false);
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32600,
+          errorMessage: "Invalid request",
+        }),
+      ),
+      false,
+    );
+    NodeAssert.equal(
+      isCodexActiveWriterError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "thread 019f already has an active writer",
+        }),
+      ),
+      false,
+    );
+  });
+
   it("ignores unrelated missing-resource errors that do not mention threads", () => {
     NodeAssert.equal(
       isRecoverableThreadResumeError(
@@ -848,6 +1164,39 @@ describe("openCodexThread", () => {
 
       NodeAssert.ok(isCodexAppServerRequestError(error));
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
+    }),
+  );
+
+  it.effect("never falls back to a new thread when the existing thread has a writer", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const client = {
+        request: <M extends "thread/start" | "thread/resume">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.fail(
+            new CodexErrors.CodexAppServerRequestError({
+              code: -32600,
+              errorMessage: "thread provider-thread-1 already has an active writer",
+            }),
+          );
+        },
+      };
+
+      const error = yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.3-codex",
+        serviceTier: undefined,
+        resumeThreadId: "provider-thread-1",
+      }).pipe(Effect.flip);
+
+      NodeAssert.equal(isCodexActiveWriterError(error), true);
+      NodeAssert.deepStrictEqual(calls, ["thread/resume"]);
     }),
   );
 });

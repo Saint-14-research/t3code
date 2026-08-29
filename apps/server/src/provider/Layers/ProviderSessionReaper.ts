@@ -13,6 +13,7 @@ import {
 } from "../Services/ProviderSessionReaper.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
+import { isProviderThreadBusy } from "../threadBusy.ts";
 
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -62,22 +63,19 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         const thread = yield* projectionSnapshotQuery
           .getThreadShellById(binding.threadId)
           .pipe(Effect.map(Option.getOrUndefined));
-        if (thread?.session?.activeTurnId != null) {
-          yield* Effect.logDebug("provider.session.reaper.skipped-active-turn", {
+        // A startup record can survive a crash without ever reaching ready.
+        // Give startup twice the normal inactivity budget, but eventually
+        // reclaim it when there is no active turn or background work.
+        const staleStartupOnly =
+          thread?.session?.status === "starting" &&
+          thread.session.activeTurnId == null &&
+          thread.backgroundLiveness == null &&
+          idleDurationMs >= inactivityThresholdMs * 2;
+        if (thread !== undefined && isProviderThreadBusy(thread) && !staleStartupOnly) {
+          yield* Effect.logDebug("provider.session.reaper.skipped-busy-thread", {
             threadId: binding.threadId,
-            activeTurnId: thread.session.activeTurnId,
-            idleDurationMs,
-          });
-          continue;
-        }
-
-        // The turn can settle while background work runs on (subagent
-        // fleets, workflow runs, Monitor watch loops). Those live inside the
-        // provider process, so stopping the session would kill them silently,
-        // and nothing bumps lastSeenAt between turns.
-        if (thread?.backgroundLiveness != null) {
-          yield* Effect.logDebug("provider.session.reaper.skipped-background-work", {
-            threadId: binding.threadId,
+            sessionStatus: thread.session?.status,
+            activeTurnId: thread.session?.activeTurnId,
             backgroundLiveness: thread.backgroundLiveness,
             idleDurationMs,
           });
