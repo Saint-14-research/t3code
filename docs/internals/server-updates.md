@@ -29,6 +29,10 @@ Every write uses same-directory replacement plus file and directory fsync.
 
 ## Remote Update
 
+Before staging and again immediately before launcher handoff, the active server reads the command
+projection and refuses while any provider session is starting/running, any turn is active, or
+native background work is live.
+
 1. The active server installs `t3@<target>` into a unique staging directory.
 2. The target runs `__service-preflight` and verifies that the stable launcher supports its update
    protocol.

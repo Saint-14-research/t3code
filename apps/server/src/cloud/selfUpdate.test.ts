@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import { ServerSelfUpdateError } from "@t3tools/contracts";
 import { HostProcessExecutablePath } from "@t3tools/shared/hostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -19,6 +20,8 @@ interface HarnessOptions {
   readonly managed?: boolean;
   readonly preflight?: "ready" | "blocked";
   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
+  readonly busyThreadCounts?: ReadonlyArray<number>;
+  readonly busyThreadReadError?: string;
 }
 
 const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
@@ -85,7 +88,18 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
   const config = yield* ServerConfig.ServerConfig.pipe(
     Effect.provide(ServerConfig.layerTest(process.cwd(), baseDir)),
   );
-  const selfUpdate = yield* ServerSelfUpdate.make().pipe(
+  let busyThreadReadIndex = 0;
+  const selfUpdate = yield* ServerSelfUpdate.make({
+    readBusyThreadCount: () => {
+      if (options.busyThreadReadError !== undefined) {
+        return Effect.fail(new ServerSelfUpdateError({ reason: options.busyThreadReadError }));
+      }
+      const counts = options.busyThreadCounts ?? [0];
+      const count = counts[Math.min(busyThreadReadIndex, counts.length - 1)] ?? 0;
+      busyThreadReadIndex += 1;
+      return Effect.succeed(count);
+    },
+  }).pipe(
     Effect.provideService(ProcessRunner.ProcessRunner, runner),
     Effect.provideService(ServiceLauncherClient.ServiceLauncherClient, launcher),
     Effect.provideService(HostProcessExecutablePath, "/usr/bin/node"),
@@ -127,6 +141,37 @@ it.layer(NodeServices.layer)("server self update", (it) => {
       expect((yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason).toBe(
         "local update required",
       );
+    }),
+  );
+
+  it.effect("refuses before staging when provider work is active", () =>
+    Effect.gen(function* () {
+      const { selfUpdate, order } = yield* makeHarness({
+        busyThreadCounts: [1],
+      });
+      const error = yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
+      expect(error.reason).toContain("1 T3 Code task is still active");
+      expect(order).toEqual([]);
+    }),
+  );
+
+  it.effect("refuses activation when work becomes active after staging", () =>
+    Effect.gen(function* () {
+      const { selfUpdate, order } = yield* makeHarness({ busyThreadCounts: [0, 1] });
+      const error = yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
+      expect(error.reason).toContain("1 T3 Code task is still active");
+      expect(order).toEqual(["install", "preflight"]);
+    }),
+  );
+
+  it.effect("refuses when active-work state cannot be read", () =>
+    Effect.gen(function* () {
+      const { selfUpdate, order } = yield* makeHarness({
+        busyThreadReadError: "Could not verify that active work is idle.",
+      });
+      const error = yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
+      expect(error.reason).toBe("Could not verify that active work is idle.");
+      expect(order).toEqual([]);
     }),
   );
 
