@@ -4,8 +4,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NetService from "@t3tools/shared/Net";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -14,7 +16,7 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { SshPasswordPrompt } from "./auth.ts";
-import { collectProcessOutput } from "./command.ts";
+import { collectProcessOutput, remoteStateKey } from "./command.ts";
 import {
   buildRemoteLaunchScript,
   buildRemotePairingScript,
@@ -120,6 +122,27 @@ const runT3DiscoveryProbe = (port: number) =>
     return { exitCode, stdout };
   });
 
+const runRemoteShellScript = (script: string, home: string, stateKey = "test") =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(
+      ChildProcess.make("/bin/sh", ["-s", "--", stateKey], {
+        env: { ...process.env, HOME: home },
+        extendEnv: false,
+        stdin: {
+          stream: Stream.make(new TextEncoder().encode(script)),
+          endOnDone: true,
+        },
+      }),
+    );
+    const [stdout, stderr, exitCode] = yield* Effect.all([
+      collectProcessOutput(child.stdout),
+      collectProcessOutput(child.stderr),
+      child.exitCode.pipe(Effect.map(Number)),
+    ]);
+    return { exitCode, stderr, stdout };
+  });
+
 const discoveryServerFixture = new URL("./testFixtures/t3DiscoveryServer.mjs", import.meta.url)
   .pathname;
 
@@ -176,6 +199,9 @@ describe("ssh tunnel scripts", () => {
         executablePath: "/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)",
         entryPath:
           "/Applications/T3 Code (Alpha).app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
+        fallbackExecutablePath: "/Applications/T3i Code.app/Contents/MacOS/T3 Code (Alpha)",
+        fallbackEntryPath:
+          "/Applications/T3i Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
         version: "0.0.33",
       },
     });
@@ -184,6 +210,10 @@ describe("ssh tunnel scripts", () => {
       script,
       "T3_DESKTOP_CLI_EXECUTABLE='/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)'",
     );
+    assert.include(
+      script,
+      "T3_DESKTOP_CLI_FALLBACK_EXECUTABLE='/Applications/T3i Code.app/Contents/MacOS/T3 Code (Alpha)'",
+    );
     assert.include(script, 'T3_INSTALLED_DESKTOP_CLI_VERSION="$(env ELECTRON_RUN_AS_NODE=1');
     assert.include(
       script,
@@ -191,7 +221,7 @@ describe("ssh tunnel scripts", () => {
     );
     assert.include(
       script,
-      'exec env ELECTRON_RUN_AS_NODE=1 "$T3_DESKTOP_CLI_EXECUTABLE" "$T3_DESKTOP_CLI_ENTRY" "$@"',
+      'exec env ELECTRON_RUN_AS_NODE=1 "$DESKTOP_EXECUTABLE" "$DESKTOP_ENTRY" "$@"',
     );
     assert.include(script, "exec npx --yes 't3@0.0.33' \"$@\"");
   });
@@ -239,9 +269,17 @@ describe("ssh tunnel scripts", () => {
 
     assert.include(
       buildRemoteLaunchScript({ nodeEngineRange: TEST_NODE_ENGINE_RANGE }),
-      '[ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null',
+      'elif is_managed_t3_process "$REMOTE_PID" "$REMOTE_PORT"; then',
     );
     assert.include(buildRemoteLaunchScript(), "RUNNER_CHANGED=1");
+    assert.include(
+      buildRemoteLaunchScript(),
+      'LAUNCH_LOCK_FILE="$HOME/.t3/ssh-launch/.launch.lock"',
+    );
+    assert.include(buildRemoteLaunchScript(), 'exec 9>"$LAUNCH_LOCK_FILE"');
+    assert.include(buildRemoteLaunchScript(), "lockf -s -t 85 9");
+    assert.include(buildRemoteLaunchScript(), "flock -w 85 9");
+    assert.notInclude(buildRemoteLaunchScript(), "LOCK_OWNER_PID");
     assert.include(buildRemoteLaunchScript(), "ensure_remote_node_path()");
     assert.include(buildRemoteLaunchScript(), "if ! ensure_remote_node_path; then");
     assert.include(
@@ -253,6 +291,8 @@ describe("ssh tunnel scripts", () => {
       "does not satisfy required range ",
     );
     assert.include(buildRemoteLaunchScript(), 'kill "$REMOTE_PID" 2>/dev/null || true');
+    assert.include(buildRemoteLaunchScript(), "is_managed_t3_process()");
+    assert.include(buildRemoteLaunchScript(), '*serve*"--port $PORT_TO_CHECK"*');
     assert.include(buildRemoteLaunchScript(), "wait_ready");
     assert.include(buildRemoteLaunchScript(), '"$RUNNER_FILE" serve --host 127.0.0.1');
     assert.include(buildRemoteLaunchScript(), '--base-dir "$DEFAULT_SERVER_HOME"');
@@ -271,10 +311,15 @@ describe("ssh tunnel scripts", () => {
     assert.include(buildRemotePairingScript(target, { packageSpec: "t3@nightly" }), "t3@nightly");
     assert.include(
       buildRemoteStopScript(target),
-      'if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ]',
+      'if [ "$REMOTE_MANAGED" != "external" ] && [ "$REMOTE_PID_MATCHES" -eq 1 ]',
     );
     assert.include(buildRemoteStopScript(target), 'kill "$REMOTE_PID" 2>/dev/null || true');
-    assert.include(buildRemoteStopScript(target), 'rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"');
+    assert.include(buildRemoteStopScript(target), 'REMOTE_PORT="$(cat "$PORT_FILE"');
+    assert.include(buildRemoteStopScript(target), '*serve*"--port $REMOTE_PORT"*');
+    assert.include(
+      buildRemoteStopScript(target),
+      'rm -f "$PID_FILE" "$PID_START_FILE" "$PORT_FILE" "$MANAGED_FILE"',
+    );
     assert.include(
       buildRemoteLaunchScript(),
       'DEFAULT_RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"',
@@ -299,6 +344,14 @@ describe("ssh tunnel scripts", () => {
       "if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port))",
     );
     assert.include(buildRemoteLaunchScript(), 'PID_TO_STOP="${REMOTE_PID:-$DEFAULT_RUNTIME_PID}"');
+    assert.isBelow(
+      buildRemoteLaunchScript().indexOf('PREVIOUS_REMOTE_PORT="$REMOTE_PORT"'),
+      buildRemoteLaunchScript().indexOf('REMOTE_PORT="$DEFAULT_REMOTE_PORT"'),
+    );
+    assert.include(
+      buildRemoteLaunchScript(),
+      'is_managed_t3_process "$PID_TO_STOP" "$PREVIOUS_REMOTE_PORT"',
+    );
     assert.include(buildRemoteLaunchScript(), 'REMOTE_PORT="$DEFAULT_REMOTE_PORT"');
     assert.include(buildRemoteLaunchScript(), 'rm -f "$PID_FILE"');
     assert.include(buildRemoteLaunchScript(), "printf 'external\\n' >\"$MANAGED_FILE\"");
@@ -318,9 +371,314 @@ describe("ssh tunnel scripts", () => {
     );
     assert.isBelow(
       buildRemoteLaunchScript().indexOf('DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port'),
-      buildRemoteLaunchScript().indexOf('elif [ -n "$REMOTE_PID" ]'),
+      buildRemoteLaunchScript().indexOf('elif is_managed_t3_process "$REMOTE_PID"'),
     );
   });
+
+  it.live("never starts a competing SSH server when a remote desktop app is installed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const net = yield* NetService.NetService;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ssh-desktop-owner-" });
+      const executablePath = path.join(home, "Applications/T3i Code.app/MacOS/T3 Code (Alpha)");
+      const entryPath = path.join(home, "Applications/T3i Code.app/bin.mjs");
+      yield* fs.makeDirectory(path.dirname(executablePath), { recursive: true });
+      yield* fs.writeFileString(executablePath, "#!/bin/sh\nexit 1\n");
+      yield* fs.chmod(executablePath, 0o755);
+      const options = {
+        desktopCli: {
+          executablePath: path.join(home, "missing-primary"),
+          entryPath,
+          fallbackExecutablePath: executablePath,
+          fallbackEntryPath: entryPath,
+          version: "0.0.35",
+        },
+      } as const;
+
+      const emptyPort = yield* net.reserveLoopbackPort();
+      const coldResult = yield* runRemoteShellScript(
+        buildRemoteLaunchScript(options).replaceAll("3773", String(emptyPort)),
+        home,
+        "desktop-owner-cold",
+      );
+      assert.notEqual(coldResult.exitCode, 0);
+      assert.include(coldResult.stderr, "Open T3 Code on the remote Mac");
+      assert.isFalse(yield* fs.exists(path.join(home, ".t3/ssh-launch/desktop-owner-cold/pid")));
+
+      const { port } = yield* Effect.acquireRelease(startDiscoveryServer("t3"), ({ child }) =>
+        child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 }).pipe(Effect.ignore),
+      );
+      const liveResult = yield* runRemoteShellScript(
+        buildRemoteLaunchScript(options).replaceAll("3773", String(port)),
+        home,
+        "desktop-owner-live",
+      );
+      assert.equal(liveResult.exitCode, 0, liveResult.stderr);
+      assert.include(liveResult.stdout, `"remotePort":${String(port)}`);
+      assert.include(liveResult.stdout, '"serverKind":"external"');
+      assert.isFalse(yield* fs.exists(path.join(home, ".t3/ssh-launch/desktop-owner-live/pid")));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, NetService.layer),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.live("does not kill a reused PID whose recorded process start no longer matches", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const net = yield* NetService.NetService;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ssh-stale-pid-" });
+      const port = yield* net.reserveLoopbackPort();
+      const target = {
+        alias: "stale-pid",
+        hostname: "example.invalid",
+        username: "tester",
+        port: 22,
+      } as const;
+      const child = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, [
+          "-e",
+          "setInterval(() => {}, 1000)",
+          "serve",
+          "--port",
+          String(port),
+        ]),
+      );
+      const stateDir = path.join(home, ".t3/ssh-launch", remoteStateKey(target));
+      yield* fs.makeDirectory(stateDir, { recursive: true });
+      yield* fs.writeFileString(path.join(stateDir, "pid"), String(child.pid));
+      yield* fs.writeFileString(path.join(stateDir, "pid-start"), "stale process identity");
+      yield* fs.writeFileString(path.join(stateDir, "port"), String(port));
+      yield* fs.writeFileString(path.join(stateDir, "managed"), "managed");
+
+      const stopResult = yield* runRemoteShellScript(buildRemoteStopScript(target), home);
+      assert.equal(stopResult.exitCode, 0, stopResult.stderr);
+      assert.isTrue(yield* child.isRunning);
+      assert.isFalse(yield* fs.exists(path.join(stateDir, "pid")));
+      yield* child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 });
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer)), Effect.scoped),
+  );
+
+  it.live("stops the old managed port before adopting a desktop runtime", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const net = yield* NetService.NetService;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ssh-runtime-handover-" });
+      const serverPath = path.join(home, "fake-runtime-server.mjs");
+      yield* fs.writeFileString(
+        serverPath,
+        `import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+const args = process.argv.slice(2);
+const port = Number(args[args.indexOf("--port") + 1]);
+const baseDir = args[args.indexOf("--base-dir") + 1];
+const server = http.createServer((request, response) => {
+  if (request.url === "/.well-known/t3/environment") {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ environmentId: "handover-test", serverVersion: "test" }));
+  } else if (request.url === "/") {
+    response.end("ok");
+  } else {
+    response.statusCode = 404;
+    response.end();
+  }
+});
+server.listen(port, "127.0.0.1", () => {
+  const stateDir = path.join(baseDir, "userdata");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "server-runtime.json"), JSON.stringify({
+    pid: process.pid,
+    port,
+    origin: "http://127.0.0.1:" + String(port),
+  }));
+});
+`,
+      );
+      const oldPort = yield* net.reserveLoopbackPort();
+      const desktopPort = yield* net.reserveLoopbackPort();
+      const startServer = (port: number) =>
+        Effect.gen(function* () {
+          const child = yield* spawner.spawn(
+            ChildProcess.make(process.execPath, [
+              serverPath,
+              "serve",
+              "--host",
+              "127.0.0.1",
+              "--port",
+              String(port),
+              "--base-dir",
+              path.join(home, ".t3"),
+            ]),
+          );
+          yield* waitForHttpReady({
+            baseUrl: `http://127.0.0.1:${String(port)}/`,
+            timeoutMs: 2_000,
+          });
+          return child;
+        });
+      const oldServer = yield* Effect.acquireRelease(startServer(oldPort), (child) =>
+        child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 }).pipe(Effect.ignore),
+      );
+      const processStartProbe = yield* spawner.spawn(
+        ChildProcess.make("/bin/ps", ["-o", "lstart=", "-p", String(oldServer.pid)]),
+      );
+      const oldProcessStart = (yield* collectProcessOutput(processStartProbe.stdout)).trim();
+      yield* processStartProbe.exitCode;
+      const stateDir = path.join(home, ".t3/ssh-launch/handover");
+      yield* fs.makeDirectory(stateDir, { recursive: true });
+      yield* fs.writeFileString(path.join(stateDir, "pid"), String(oldServer.pid));
+      yield* fs.writeFileString(path.join(stateDir, "pid-start"), oldProcessStart);
+      yield* fs.writeFileString(path.join(stateDir, "port"), String(oldPort));
+      yield* fs.writeFileString(path.join(stateDir, "managed"), "managed");
+
+      const desktopServer = yield* Effect.acquireRelease(startServer(desktopPort), (child) =>
+        child.kill({ killSignal: "SIGTERM", forceKillAfter: 1_000 }).pipe(Effect.ignore),
+      );
+      assert.isTrue(yield* desktopServer.isRunning);
+
+      const result = yield* runRemoteShellScript(
+        buildRemoteLaunchScript({ nodeScriptPath: serverPath }),
+        home,
+        "handover",
+      );
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.include(result.stdout, `"remotePort":${String(desktopPort)}`);
+      assert.include(result.stdout, '"serverKind":"external"');
+      assert.isFalse(yield* oldServer.isRunning);
+      assert.isTrue(yield* desktopServer.isRunning);
+      assert.isFalse(yield* fs.exists(path.join(stateDir, "pid")));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, NetService.layer),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.live("releases the advisory launcher lock when its process is killed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const net = yield* NetService.NetService;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ssh-launch-lock-" });
+      const serverPath = path.join(home, "fake-t3-server.mjs");
+      const port = yield* net.reserveLoopbackPort();
+      yield* fs.writeFileString(
+        serverPath,
+        `import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+const args = process.argv.slice(2);
+const port = Number(args[args.indexOf("--port") + 1]);
+const baseDir = args[args.indexOf("--base-dir") + 1];
+const readyAt = Date.now() + 3000;
+const server = http.createServer((request, response) => {
+  if (Date.now() < readyAt) {
+    response.statusCode = 503;
+    response.end();
+    return;
+  }
+  if (request.url === "/.well-known/t3/environment") {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ environmentId: "lock-test", serverVersion: "test" }));
+  } else if (request.url === "/") {
+    response.end("ok");
+  } else {
+    response.statusCode = 404;
+    response.end();
+  }
+});
+server.listen(port, "127.0.0.1", () => {
+  const stateDir = path.join(baseDir, "userdata");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "server-runtime.json"), JSON.stringify({
+    pid: process.pid,
+    port,
+    origin: "http://127.0.0.1:" + String(port),
+  }));
+});
+`,
+      );
+      const script = buildRemoteLaunchScript({ nodeScriptPath: serverPath }).replaceAll(
+        "3773",
+        String(port),
+      );
+      const makeLauncher = () =>
+        ChildProcess.make("/bin/sh", ["-s", "--", "lock-test"], {
+          env: { ...process.env, HOME: home },
+          extendEnv: false,
+          stdin: {
+            stream: Stream.make(new TextEncoder().encode(script)),
+            endOnDone: true,
+          },
+        });
+
+      const first = yield* spawner.spawn(makeLauncher());
+      const lockPath = path.join(home, ".t3/ssh-launch/.launch.lock");
+      let lockObserved = false;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (yield* fs.exists(lockPath)) {
+          const probe = yield* spawner.spawn(
+            ChildProcess.make("/bin/sh", ["-c", 'exec 8>"$1"; lockf -s -t 0 8', "--", lockPath]),
+          );
+          const probeExit = yield* probe.exitCode.pipe(Effect.map(Number));
+          if (probeExit !== 0) {
+            lockObserved = true;
+            break;
+          }
+        }
+        if (!(yield* first.isRunning)) {
+          break;
+        }
+        yield* Effect.sleep(Duration.millis(10));
+      }
+      assert.isTrue(lockObserved);
+      yield* first.kill({ killSignal: "SIGKILL", forceKillAfter: 1_000 });
+      yield* first.exitCode.pipe(Effect.ignore);
+
+      const second = yield* spawner.spawn(makeLauncher());
+      const [stdout, stderr, exitCode] = yield* Effect.all([
+        collectProcessOutput(second.stdout),
+        collectProcessOutput(second.stderr),
+        second.exitCode.pipe(Effect.map(Number)),
+      ]);
+      assert.equal(exitCode, 0, stderr);
+      assert.include(stdout, `"remotePort":${String(port)}`);
+      const releasedProbe = yield* spawner.spawn(
+        ChildProcess.make("/bin/sh", ["-c", 'exec 8>"$1"; lockf -s -t 0 8', "--", lockPath]),
+      );
+      assert.equal(yield* releasedProbe.exitCode.pipe(Effect.map(Number)), 0);
+
+      const managedPid = Number(
+        yield* fs
+          .readFileString(path.join(home, ".t3/ssh-launch/lock-test/pid"))
+          .pipe(Effect.orElseSucceed(() => "")),
+      );
+      if (Number.isInteger(managedPid) && managedPid > 0) {
+        yield* Effect.sync(() => {
+          try {
+            process.kill(managedPid, "SIGTERM");
+          } catch {
+            // The test server may already have exited.
+          }
+        });
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, NetService.layer),
+      ),
+      Effect.scoped,
+    ),
+  );
 
   it.effect("accepts launch JSON after remote shell startup noise", () => {
     const target = {
