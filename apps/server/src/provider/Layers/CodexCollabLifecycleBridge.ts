@@ -1,4 +1,5 @@
 const BRIDGE_VERSION = "t3-codex-collab-lifecycle-bridge-v1";
+const PREPARED_TASK_TOKEN_PATTERN = /^dpt1_[0-9a-f]{48}$/;
 
 export const CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV = "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV";
 
@@ -35,7 +36,8 @@ export type CodexCollabLifecycleHookPayload =
       readonly tool_input: {
         readonly message: string;
         readonly agent_type: string;
-        readonly task_source?: "agent-path-fallback";
+        readonly task_source?: "agent-path-fallback" | "prepared-host-registration";
+        readonly prepared_task_token?: string;
         readonly model?: string;
         readonly reasoning_effort?: string;
       };
@@ -106,7 +108,11 @@ interface Attempt {
   prompt: string;
   readonly model: string | undefined;
   readonly reasoningEffort: string | undefined;
-  readonly taskSource: "exact-tool-prompt" | "agent-path-fallback";
+  readonly taskSource:
+    | "exact-tool-prompt"
+    | "agent-path-fallback"
+    | "prepared-host-registration";
+  readonly preparedTaskToken: string | undefined;
   agentId: string | undefined;
   agentType: string | undefined;
   startSeen: boolean;
@@ -158,6 +164,7 @@ export class CodexCollabLifecycleBridge {
       model: nonEmptyString(call.model),
       reasoningEffort: nonEmptyString(call.reasoningEffort),
       taskSource: "exact-tool-prompt",
+      preparedTaskToken: undefined,
       agentId: undefined,
       agentType: undefined,
       startSeen: false,
@@ -202,6 +209,7 @@ export class CodexCollabLifecycleBridge {
       model: undefined,
       reasoningEffort: undefined,
       taskSource: "agent-path-fallback",
+      preparedTaskToken: undefined,
       agentId: undefined,
       agentType: undefined,
       startSeen: false,
@@ -226,13 +234,15 @@ export class CodexCollabLifecycleBridge {
     if (this.#attemptsByToolUseId.has(input.id)) {
       return [];
     }
+    const preparedTaskToken = isPreparedTaskToken(input.taskName) ? input.taskName : undefined;
     const attempt: Attempt = {
       toolUseId: input.id,
       tool: "spawnAgent",
       prompt: `Codex delegated task name: ${input.taskName}`,
       model: nonEmptyString(input.model),
       reasoningEffort: nonEmptyString(input.reasoningEffort),
-      taskSource: "agent-path-fallback",
+      taskSource: preparedTaskToken ? "prepared-host-registration" : "agent-path-fallback",
+      preparedTaskToken,
       agentId: undefined,
       agentType: nonEmptyString(input.agentType),
       startSeen: false,
@@ -372,8 +382,11 @@ export class CodexCollabLifecycleBridge {
       tool_input: {
         message: attempt.prompt,
         agent_type: attempt.agentType ?? "unknown",
-        ...(attempt.taskSource === "agent-path-fallback"
+        ...(attempt.taskSource !== "exact-tool-prompt"
           ? { task_source: attempt.taskSource }
+          : {}),
+        ...(attempt.preparedTaskToken
+          ? { prepared_task_token: attempt.preparedTaskToken }
           : {}),
         ...(attempt.model ? { model: attempt.model } : {}),
         ...(attempt.reasoningEffort ? { reasoning_effort: attempt.reasoningEffort } : {}),
@@ -458,6 +471,10 @@ export function parseCodexCollabLifecycleHookArgv(
 
 function nonEmptyString(value: string | null | undefined): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isPreparedTaskToken(value: string): boolean {
+  return PREPARED_TASK_TOKEN_PATTERN.test(value);
 }
 
 function freezeChildTurnActuals(actuals: CodexChildTurnActuals): CodexChildTurnActuals {
