@@ -1591,6 +1591,7 @@ export const makeCodexSessionRuntime = (
             ? { reasoningEffort: item.reasoningEffort }
             : {}),
           receiverThreadIds: item.receiverThreadIds,
+          status: item.status,
         });
         const exactReceiver =
           item.receiverThreadIds.length === 1 ? item.receiverThreadIds[0] : undefined;

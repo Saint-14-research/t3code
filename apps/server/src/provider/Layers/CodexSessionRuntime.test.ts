@@ -109,8 +109,14 @@ describe("CodexCollabLifecycleBridge", () => {
       bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
       "unknown",
     );
-    NodeAssert.equal(bound[0]?.tool_use_id, "tool-call-2");
-    NodeAssert.equal(bound[1]?.tool_use_id, "tool-call-2");
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "tool-call-2",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].tool_use_id : undefined,
+      "tool-call-2",
+    );
     NodeAssert.equal(
       bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
       "failed",
@@ -131,6 +137,79 @@ describe("CodexCollabLifecycleBridge", () => {
       ["PreToolUse"],
     );
     NodeAssert.deepStrictEqual(bridge.observeChildTerminal("child-a", "cancelled"), []);
+  });
+
+  it("binds a reused child's late followup terminal to the new attempt", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    bridge.observeToolCall({
+      id: "initial-tool",
+      tool: "spawnAgent",
+      prompt: "Run the first task",
+      receiverThreadIds: ["reused-child"],
+    });
+    bridge.observeChildRole("reused-child", "reviewer");
+    bridge.observeChildTerminal("reused-child", "completed");
+
+    const followup = {
+      id: "followup-tool",
+      tool: "followupTask" as const,
+      prompt: "Run the followup",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(followup)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(bridge.observeChildRole("reused-child", "reviewer"), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeChildTerminal("reused-child", "completed", "reviewer"),
+      [],
+    );
+
+    const bound = bridge.observeToolCall({
+      ...followup,
+      receiverThreadIds: ["reused-child"],
+      status: "completed",
+    });
+    NodeAssert.deepStrictEqual(
+      bound.map((payload) => payload.hook_event_name),
+      ["SubagentStart", "SubagentStop"],
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].tool_use_id : undefined,
+      "followup-tool",
+    );
+    NodeAssert.equal(
+      bound[0]?.hook_event_name === "SubagentStart" ? bound[0].agent_type : undefined,
+      "reviewer",
+    );
+    NodeAssert.equal(
+      bound[1]?.hook_event_name === "SubagentStop" ? bound[1].status : undefined,
+      "completed",
+    );
+  });
+
+  it("retires an unbound failed tool call and closes its session once", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const call = {
+      id: "failed-tool",
+      tool: "spawnAgent" as const,
+      prompt: "Try to spawn",
+      receiverThreadIds: [],
+      status: "inProgress" as const,
+    };
+    NodeAssert.equal(bridge.observeToolCall(call)[0]?.hook_event_name, "PreToolUse");
+    NodeAssert.deepStrictEqual(
+      bridge.observeToolCall({ ...call, status: "failed" }).map((payload) => ({
+        event: payload.hook_event_name,
+        toolUseId: "tool_use_id" in payload ? payload.tool_use_id : undefined,
+      })),
+      [{ event: "PostToolUseFailure", toolUseId: "failed-tool" }],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeToolCall({ ...call, status: "failed" }), []);
+    NodeAssert.deepStrictEqual(
+      bridge.observeSessionClose([]).map((payload) => payload.hook_event_name),
+      ["SessionEnd"],
+    );
+    NodeAssert.deepStrictEqual(bridge.observeSessionClose([]), []);
   });
 
   it("terminalizes registered active children when their session closes", () => {
@@ -156,6 +235,12 @@ describe("CodexCollabLifecycleBridge", () => {
           consumer_surface: "t3-native-collaboration",
           bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
         },
+        {
+          hook_event_name: "SessionEnd",
+          session_id: "parent-thread",
+          consumer_surface: "t3-native-collaboration",
+          bridge_version: "t3-codex-collab-lifecycle-bridge-v1",
+        },
       ],
     );
     NodeAssert.deepStrictEqual(
@@ -176,7 +261,7 @@ describe("CodexCollabLifecycleBridge", () => {
     const payloads = bridge.observeSessionClose([]);
     NodeAssert.deepStrictEqual(
       payloads.map((payload) => payload.hook_event_name),
-      ["SubagentStart", "SubagentStop"],
+      ["SubagentStart", "SubagentStop", "SessionEnd"],
     );
     NodeAssert.equal(
       payloads[0]?.hook_event_name === "SubagentStart" ? payloads[0].agent_type : undefined,
