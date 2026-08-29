@@ -34,6 +34,52 @@ import {
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
 describe("CodexCollabLifecycleBridge", () => {
+  it("records the captured native spawn boundary with explicit path-only provenance", () => {
+    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const payloads = [
+      ...bridge.observeNativeDispatch({
+        id: "call-native-spawn",
+        taskName: "native_lifecycle_canary",
+        agentType: "mechanical",
+      }),
+      ...bridge.observeNativeSpawn({
+        id: "call-native-spawn",
+        agentId: "child-native",
+        agentPath: "/root/native_lifecycle_canary",
+      }),
+      ...bridge.observeChildRole("child-native", "mechanical"),
+    ];
+
+    NodeAssert.deepStrictEqual(
+      payloads.map((payload) => payload.hook_event_name),
+      ["PreToolUse", "SubagentStart"],
+    );
+    NodeAssert.deepStrictEqual(
+      payloads[0]?.hook_event_name === "PreToolUse" ? payloads[0].tool_input : undefined,
+      {
+        message: "Codex delegated task name: native_lifecycle_canary",
+        agent_type: "mechanical",
+        task_source: "agent-path-fallback",
+      },
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStart" ? payloads[1].tool_use_id : undefined,
+      "call-native-spawn",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStart" ? payloads[1].agent_type : undefined,
+      "mechanical",
+    );
+    NodeAssert.deepStrictEqual(
+      bridge.observeNativeSpawn({
+        id: "call-native-spawn",
+        agentId: "child-native",
+        agentPath: "/root/native_lifecycle_canary",
+      }),
+      [],
+    );
+  });
+
   it("emits the native hook lifecycle once for one causally bound child", () => {
     const bridge = new CodexCollabLifecycleBridge("parent-thread");
     const dispatched = bridge.observeToolCall({

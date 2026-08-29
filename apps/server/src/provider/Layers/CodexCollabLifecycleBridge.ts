@@ -20,7 +20,8 @@ export type CodexCollabLifecycleHookPayload =
       readonly tool_use_id: string;
       readonly tool_input: {
         readonly message: string;
-        readonly agent_type: "unknown";
+        readonly agent_type: string;
+        readonly task_source?: "agent-path-fallback";
         readonly model?: string;
         readonly reasoning_effort?: string;
       };
@@ -88,6 +89,7 @@ interface Attempt {
   prompt: string;
   readonly model: string | undefined;
   readonly reasoningEffort: string | undefined;
+  readonly taskSource: "exact-tool-prompt" | "agent-path-fallback";
   agentId: string | undefined;
   agentType: string | undefined;
   startSeen: boolean;
@@ -130,6 +132,7 @@ export class CodexCollabLifecycleBridge {
       prompt: call.prompt,
       model: nonEmptyString(call.model),
       reasoningEffort: nonEmptyString(call.reasoningEffort),
+      taskSource: "exact-tool-prompt",
       agentId: undefined,
       agentType: undefined,
       startSeen: false,
@@ -145,6 +148,75 @@ export class CodexCollabLifecycleBridge {
       ...this.#bind(attempt, call.receiverThreadIds),
       ...this.#failUnbound(attempt, call.status),
     ];
+  }
+
+  /**
+   * Current Codex multi-agent wire records a successful spawn as a parent-side
+   * subAgentActivity item. Its item id is the provider tool-call id and its
+   * child id is the binding authority, but the full task is intentionally not
+   * available on this projection. Record that provenance explicitly instead
+   * of silently losing the lifecycle or pretending the path is exact task
+   * text.
+   */
+  observeNativeSpawn(input: {
+    readonly id: string;
+    readonly agentId: string;
+    readonly agentPath: string;
+  }): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+    const existing = this.#attemptsByToolUseId.get(input.id);
+    if (existing) {
+      return this.#bind(existing, [input.agentId]);
+    }
+    const taskName =
+      input.agentPath.split("/").findLast((segment) => segment.length > 0) ?? "unknown";
+    const attempt: Attempt = {
+      toolUseId: input.id,
+      tool: "spawnAgent",
+      prompt: `Codex delegated task name: ${taskName}`,
+      model: undefined,
+      reasoningEffort: undefined,
+      taskSource: "agent-path-fallback",
+      agentId: undefined,
+      agentType: undefined,
+      startSeen: false,
+      terminalSeen: false,
+      terminalStatus: undefined,
+      failureSeen: false,
+    };
+    this.#attemptsByToolUseId.set(input.id, attempt);
+    const preToolUse = this.#preToolUse(attempt);
+    attempt.prompt = "";
+    return [preToolUse, ...this.#bind(attempt, [input.agentId])];
+  }
+
+  observeNativeDispatch(input: {
+    readonly id: string;
+    readonly taskName: string;
+    readonly agentType?: string | undefined;
+    readonly model?: string | undefined;
+    readonly reasoningEffort?: string | undefined;
+  }): ReadonlyArray<CodexCollabLifecycleHookPayload> {
+    if (this.#attemptsByToolUseId.has(input.id)) {
+      return [];
+    }
+    const attempt: Attempt = {
+      toolUseId: input.id,
+      tool: "spawnAgent",
+      prompt: `Codex delegated task name: ${input.taskName}`,
+      model: nonEmptyString(input.model),
+      reasoningEffort: nonEmptyString(input.reasoningEffort),
+      taskSource: "agent-path-fallback",
+      agentId: undefined,
+      agentType: nonEmptyString(input.agentType),
+      startSeen: false,
+      terminalSeen: false,
+      terminalStatus: undefined,
+      failureSeen: false,
+    };
+    this.#attemptsByToolUseId.set(input.id, attempt);
+    const preToolUse = this.#preToolUse(attempt);
+    attempt.prompt = "";
+    return [preToolUse];
   }
 
   observeChildTerminal(
@@ -170,9 +242,10 @@ export class CodexCollabLifecycleBridge {
     agentId: string,
     agentType: string | undefined,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
-    const normalizedAgentType = nonEmptyString(agentType) ?? "unknown";
-    this.#agentTypes.set(agentId, normalizedAgentType);
     const attempt = this.#attemptsByAgentId.get(agentId);
+    const normalizedAgentType =
+      nonEmptyString(agentType) ?? attempt?.agentType ?? this.#agentTypes.get(agentId) ?? "unknown";
+    this.#agentTypes.set(agentId, normalizedAgentType);
     if (!attempt || attempt.startSeen) {
       return [];
     }
@@ -263,7 +336,10 @@ export class CodexCollabLifecycleBridge {
       tool_use_id: attempt.toolUseId,
       tool_input: {
         message: attempt.prompt,
-        agent_type: "unknown",
+        agent_type: attempt.agentType ?? "unknown",
+        ...(attempt.taskSource === "agent-path-fallback"
+          ? { task_source: attempt.taskSource }
+          : {}),
         ...(attempt.model ? { model: attempt.model } : {}),
         ...(attempt.reasoningEffort ? { reasoning_effort: attempt.reasoningEffort } : {}),
       },

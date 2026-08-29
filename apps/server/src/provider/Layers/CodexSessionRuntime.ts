@@ -26,6 +26,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -75,6 +76,16 @@ const CODEX_COLLAB_LIFECYCLE_HOOK_TIMEOUT = "2 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_CLOSE_FLUSH_TIMEOUT = "3 seconds" as const;
 const CODEX_COLLAB_LIFECYCLE_HOOK_MAX_OUTPUT_BYTES = 8 * 1024;
 const encodeCollabLifecycleHookPayload = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeCollabRawSpawnInput = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      task_name: Schema.String,
+      agent_type: Schema.optionalKey(Schema.String),
+      model: Schema.optionalKey(Schema.String),
+      reasoning_effort: Schema.optionalKey(Schema.String),
+    }),
+  ),
+);
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -1606,6 +1617,42 @@ export const makeCodexSessionRuntime = (
         ]);
       });
 
+    const observeCollabLifecycleRawCall = (notification: CodexServerNotification) =>
+      Effect.gen(function* () {
+        if (notification.method !== "rawResponseItem/completed") {
+          return;
+        }
+        const item = notification.params.item;
+        if (
+          item.type !== "function_call" ||
+          item.namespace !== "collaboration" ||
+          item.name !== "spawn_agent"
+        ) {
+          return;
+        }
+        const rootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+        if (!rootThreadId || notification.params.threadId !== rootThreadId) {
+          return;
+        }
+        const record = Option.getOrUndefined(decodeCollabRawSpawnInput(item.arguments));
+        if (!record || record.task_name.length === 0) {
+          return;
+        }
+        const bridge =
+          (yield* Ref.get(collabLifecycleBridgeRef)) ??
+          new CodexCollabLifecycleBridge(rootThreadId);
+        yield* Ref.set(collabLifecycleBridgeRef, bridge);
+        yield* deliverCollabLifecycleHooks(
+          bridge.observeNativeDispatch({
+            id: item.call_id,
+            taskName: record.task_name,
+            ...(record.agent_type ? { agentType: record.agent_type } : {}),
+            ...(record.model ? { model: record.model } : {}),
+            ...(record.reasoning_effort ? { reasoningEffort: record.reasoning_effort } : {}),
+          }),
+        );
+      });
+
     const observeCollabLifecycleTerminal = (
       agentId: string,
       status: "completed" | "cancelled" | "failed",
@@ -1758,6 +1805,20 @@ export const makeCodexSessionRuntime = (
           });
           const registeredChild = (yield* Ref.get(collabChildAgentsRef)).get(item.agentThreadId);
           const metadata = (yield* Ref.get(collabChildMetadataRef)).get(item.agentThreadId);
+          if (item.kind === "started" && rootProviderThreadId) {
+            const bridge =
+              (yield* Ref.get(collabLifecycleBridgeRef)) ??
+              new CodexCollabLifecycleBridge(rootProviderThreadId);
+            yield* Ref.set(collabLifecycleBridgeRef, bridge);
+            yield* deliverCollabLifecycleHooks([
+              ...bridge.observeNativeSpawn({
+                id: item.id,
+                agentId: item.agentThreadId,
+                agentPath: item.agentPath,
+              }),
+              ...bridge.observeChildRole(item.agentThreadId, registeredChild?.role),
+            ]);
+          }
           yield* emitEvent({
             kind: "notification",
             threadId: options.threadId,
@@ -1977,6 +2038,7 @@ export const makeCodexSessionRuntime = (
         })();
 
         rememberCollabReceiverTurns(collabReceiverTurns, notification, route.turnId);
+        yield* observeCollabLifecycleRawCall(notification);
         yield* observeCollabLifecycleToolCall(notification);
         // Interception FIRST: a registered v2 child is usually also in the
         // receiver-turn map (collabAgentToolCall.receiverThreadIds), and the
