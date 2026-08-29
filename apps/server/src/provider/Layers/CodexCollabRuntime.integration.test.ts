@@ -22,6 +22,7 @@ import * as Stream from "effect/Stream";
 import { assert, describe } from "vite-plus/test";
 
 import wireFixture from "../testFixtures/codexMultiAgentWire.json" with { type: "json" };
+import { CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV } from "./CodexCollabLifecycleBridge.ts";
 import { makeCodexSessionRuntime } from "./CodexSessionRuntime.ts";
 
 const ROOT = wireFixture.rootThreadId;
@@ -148,6 +149,33 @@ function childSettings(threadId: string, model: string, effort: string) {
   };
 }
 
+function capturedChildTurnStarted(childId: string, turnId: string) {
+  const captured = wireFixture.notifications.find(
+    (entry) =>
+      entry.method === "turn/started" &&
+      (entry.params as { threadId?: string }).threadId === CHILD_A,
+  );
+  assert.isDefined(captured);
+  return {
+    ...captured,
+    params: {
+      ...captured.params,
+      threadId: childId,
+      turn: { ...captured.params.turn, id: turnId },
+    },
+  };
+}
+
+function childTurnCompleted(childId: string, turnId: string) {
+  return {
+    method: "turn/completed",
+    params: {
+      threadId: childId,
+      turn: { id: turnId, status: "completed", items: [] },
+    },
+  };
+}
+
 function readRecordedRequests() {
   return NodeFS.readFileSync(`${scriptPath}.requests`, "utf8")
     .trim()
@@ -157,9 +185,106 @@ function readRecordedRequests() {
 }
 
 const scriptPath = NodePath.join(import.meta.dirname, "../testFixtures/.collab-script.json");
+const hookEventsPath = NodePath.join(
+  import.meta.dirname,
+  "../testFixtures/.collab-hook-events.jsonl",
+);
+const hookCapturePath = NodePath.join(
+  import.meta.dirname,
+  "../testFixtures/codexCollabHookCapture.mjs",
+);
 const peerPath = NodePath.join(import.meta.dirname, "../testFixtures/codexCollabMockPeer.sh");
 
 describe("CodexSessionRuntime collab integration", () => {
+  it.effect("records exact child raw-response usage in the production Stop hook envelope", () =>
+    Effect.gen(function* () {
+      const childTurnId = "child-actuals-turn";
+      const script = {
+        rootThreadId: ROOT,
+        notifications: [
+          capturedStartedActivity(),
+          childSettings(CHILD_A, "gpt-5.6-luna", "high"),
+          capturedChildTurnStarted(CHILD_A, childTurnId),
+          {
+            method: "rawResponse/completed",
+            params: {
+              threadId: CHILD_A,
+              turnId: childTurnId,
+              responseId: "response-child-actuals-1",
+              usage: {
+                cachedInputTokens: 0,
+                inputTokens: 11,
+                outputTokens: 4,
+                reasoningOutputTokens: 0,
+                totalTokens: 15,
+              },
+            },
+          },
+          childTurnCompleted(CHILD_A, childTurnId),
+        ],
+      };
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      NodeFS.rmSync(hookEventsPath, { force: true });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(hookEventsPath, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-collab-child-actuals"),
+        binaryPath: peerPath,
+        cwd: "/tmp",
+        runtimeMode: "full-access",
+        environment: {
+          ...process.env,
+          T3_CODEX_COLLAB_SCRIPT: scriptPath,
+          [CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV]: JSON.stringify([
+            process.execPath,
+            hookCapturePath,
+            hookEventsPath,
+          ]),
+        },
+      });
+      const eventsFiber = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.method === "turn/completed"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "start one child and report exact usage" });
+      yield* Fiber.join(eventsFiber);
+      // The mock guardian exits via SIGTERM on this harness, which the
+      // runtime reports as a close error after delivering the hook payload.
+      // The scope still owns cleanup; the behavior under test is the emitted
+      // envelope, not mock process exit semantics.
+      yield* runtime.close.pipe(Effect.ignore);
+      const hookEvents = NodeFS.readFileSync(hookEventsPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const stop = hookEvents.find((event) => event.hook_event_name === "SubagentStop");
+      assert.deepInclude(stop, {
+        hook_event_name: "SubagentStop",
+        agent_id: CHILD_A,
+        status: "completed",
+        actuals: {
+          schema: "codex-child-turn-actuals-v1",
+          child_thread_id: CHILD_A,
+          turn_id: childTurnId,
+          model: "gpt-5.6-luna",
+          reasoning_effort: "high",
+          token_usage: { input_tokens: 11, output_tokens: 4, total_tokens: 15 },
+          token_usage_provenance: "raw-response-completed-sum-v1",
+        },
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("looks up child model metadata once after activity registration", () =>
     Effect.gen(function* () {
       const script = {

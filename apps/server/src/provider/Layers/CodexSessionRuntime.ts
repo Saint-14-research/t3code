@@ -44,6 +44,7 @@ import {
   CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
   CodexCollabLifecycleBridge,
   CodexCollabLifecycleDeliveryQueue,
+  type CodexChildTurnActuals,
   type CodexCollabLifecycleHookPayload,
   parseCodexCollabLifecycleHookArgv,
 } from "./CodexCollabLifecycleBridge.ts";
@@ -818,6 +819,7 @@ function readNotificationThreadId(notification: CodexServerNotification): string
     case "item/autoApprovalReview/completed":
     case "item/completed":
     case "rawResponseItem/completed":
+    case "rawResponse/completed":
     case "item/agentMessage/delta":
     case "item/plan/delta":
     case "item/commandExecution/outputDelta":
@@ -986,6 +988,208 @@ interface CollabChildMetadataState {
   readonly closed: boolean;
 }
 
+interface CollabChildTurnUsageState {
+  readonly turnId: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  responseCount: number;
+  invalid: boolean;
+}
+
+interface CollabRawResponseOwner {
+  readonly agentThreadId: string;
+  readonly turnId: string;
+  readonly usageFingerprint: string;
+}
+
+/**
+ * Tracks only exact `rawResponse/completed` usage for a child turn. Thread
+ * tokenUsage notifications are cumulative snapshots and must never be used
+ * as terminal actuals. A malformed boundary invalidates numeric actuals for
+ * that turn rather than producing a plausible-but-wrong value.
+ */
+export class CodexChildTurnUsageTracker {
+  readonly #turnsByAgent = new Map<string, CollabChildTurnUsageState>();
+  readonly #responseOwners = new Map<string, CollabRawResponseOwner>();
+
+  begin(agentThreadId: string, turnId: string): void {
+    const overlapping = this.#turnsByAgent.get(agentThreadId);
+    if (overlapping) {
+      // A second start without the first completion makes attribution
+      // ambiguous. Retain neither turn's numeric actuals rather than
+      // silently overwriting the first accumulator.
+      overlapping.invalid = true;
+    }
+    this.#turnsByAgent.set(agentThreadId, {
+      turnId,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      responseCount: 0,
+      invalid: overlapping !== undefined,
+    });
+  }
+
+  observeRawResponseCompleted(input: {
+    readonly agentThreadId: string;
+    readonly turnId: string;
+    readonly responseId: string;
+    readonly usage:
+      | {
+          readonly inputTokens: number;
+          readonly outputTokens: number;
+          readonly totalTokens: number;
+        }
+      | null
+      | undefined;
+  }): void {
+    const active = this.#turnsByAgent.get(input.agentThreadId);
+    if (input.responseId.length === 0) {
+      if (active) {
+        active.invalid = true;
+      }
+      return;
+    }
+    const previousOwner = this.#responseOwners.get(input.responseId);
+    if (previousOwner) {
+      if (
+        previousOwner.agentThreadId === input.agentThreadId &&
+        previousOwner.turnId === input.turnId &&
+        previousOwner.usageFingerprint === rawResponseUsageFingerprint(input.usage)
+      ) {
+        return;
+      }
+      this.#invalidate(previousOwner);
+      this.#invalidate({ agentThreadId: input.agentThreadId, turnId: input.turnId });
+      return;
+    }
+    this.#responseOwners.set(input.responseId, {
+      agentThreadId: input.agentThreadId,
+      turnId: input.turnId,
+      usageFingerprint: rawResponseUsageFingerprint(input.usage),
+    });
+    if (!active || active.turnId !== input.turnId) {
+      if (active) {
+        active.invalid = true;
+      }
+      return;
+    }
+    const usage = validRawResponseUsage(input.usage);
+    if (!usage) {
+      active.invalid = true;
+      return;
+    }
+    const inputTokens = active.inputTokens + usage.inputTokens;
+    const outputTokens = active.outputTokens + usage.outputTokens;
+    const totalTokens = active.totalTokens + usage.totalTokens;
+    if (
+      !Number.isSafeInteger(inputTokens) ||
+      !Number.isSafeInteger(outputTokens) ||
+      !Number.isSafeInteger(totalTokens) ||
+      totalTokens !== inputTokens + outputTokens
+    ) {
+      active.invalid = true;
+      return;
+    }
+    active.inputTokens = inputTokens;
+    active.outputTokens = outputTokens;
+    active.totalTokens = totalTokens;
+    active.responseCount += 1;
+  }
+
+  complete(input: {
+    readonly agentThreadId: string;
+    readonly turnId: string;
+    readonly model?: string | undefined;
+    readonly reasoningEffort?: string | undefined;
+  }): CodexChildTurnActuals {
+    const active = this.#turnsByAgent.get(input.agentThreadId);
+    const model = nonEmptyMetadataValue(input.model);
+    const reasoningEffort = nonEmptyMetadataValue(input.reasoningEffort);
+    const tokenUsage =
+      active &&
+      active.turnId === input.turnId &&
+      !active.invalid &&
+      active.responseCount > 0 &&
+      active.totalTokens === active.inputTokens + active.outputTokens
+        ? Object.freeze({
+            input_tokens: active.inputTokens,
+            output_tokens: active.outputTokens,
+            total_tokens: active.totalTokens,
+          })
+        : undefined;
+    if (active?.turnId === input.turnId) {
+      this.#turnsByAgent.delete(input.agentThreadId);
+    }
+    return Object.freeze({
+      schema: "codex-child-turn-actuals-v1",
+      child_thread_id: input.agentThreadId,
+      turn_id: input.turnId,
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      ...(tokenUsage
+        ? {
+            token_usage: tokenUsage,
+            token_usage_provenance: "raw-response-completed-sum-v1" as const,
+          }
+        : {}),
+    });
+  }
+
+  abandon(agentThreadId: string): void {
+    this.#turnsByAgent.delete(agentThreadId);
+  }
+
+  #invalidate(owner: Pick<CollabRawResponseOwner, "agentThreadId" | "turnId">): void {
+    const active = this.#turnsByAgent.get(owner.agentThreadId);
+    if (active?.turnId === owner.turnId) {
+      active.invalid = true;
+    }
+  }
+}
+
+function validRawResponseUsage(
+  usage:
+    | {
+        readonly inputTokens: number;
+        readonly outputTokens: number;
+        readonly totalTokens: number;
+      }
+    | null
+    | undefined,
+):
+  | { readonly inputTokens: number; readonly outputTokens: number; readonly totalTokens: number }
+  | undefined {
+  if (
+    !usage ||
+    !Number.isSafeInteger(usage.inputTokens) ||
+    !Number.isSafeInteger(usage.outputTokens) ||
+    !Number.isSafeInteger(usage.totalTokens) ||
+    usage.inputTokens < 0 ||
+    usage.outputTokens < 0 ||
+    usage.totalTokens < 0 ||
+    !Number.isSafeInteger(usage.inputTokens + usage.outputTokens) ||
+    usage.totalTokens !== usage.inputTokens + usage.outputTokens
+  ) {
+    return undefined;
+  }
+  return usage;
+}
+
+function rawResponseUsageFingerprint(
+  usage:
+    | {
+        readonly inputTokens: number;
+        readonly outputTokens: number;
+        readonly totalTokens: number;
+      }
+    | null
+    | undefined,
+): string {
+  return usage ? `${usage.inputTokens}:${usage.outputTokens}:${usage.totalTokens}` : "missing";
+}
+
 function collabChildIdentity(
   child: CollabChildAgentState,
   metadata: CollabChildMetadataState | undefined,
@@ -1127,6 +1331,7 @@ const CHILD_CHATTER_METHODS: ReadonlySet<string> = new Set([
   "turn/diff/updated",
   "thread/name/updated",
   "rawResponseItem/completed",
+  "rawResponse/completed",
   // Child-owned thread lifecycle: the parent adapter maps these onto the
   // PARENT thread (archived/compacted state), so a child compacting would
   // rewrite the parent. Mirrors the v1 suppressor list — dropping them is
@@ -1236,6 +1441,7 @@ export const makeCodexSessionRuntime = (
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
     const collabChildMetadataRef = yield* Ref.make(new Map<string, CollabChildMetadataState>());
+    const collabChildTurnUsageTrackerRef = yield* Ref.make(new CodexChildTurnUsageTracker());
     const collabLifecycleBridgeRef = yield* Ref.make<CodexCollabLifecycleBridge | undefined>(
       undefined,
     );
@@ -1661,11 +1867,14 @@ export const makeCodexSessionRuntime = (
       agentId: string,
       status: "completed" | "cancelled" | "failed",
       agentType?: string | undefined,
+      actuals?: CodexChildTurnActuals | undefined,
     ) =>
       Ref.get(collabLifecycleBridgeRef).pipe(
         Effect.flatMap((bridge) =>
           bridge
-            ? deliverCollabLifecycleHooks(bridge.observeChildTerminal(agentId, status, agentType))
+            ? deliverCollabLifecycleHooks(
+                bridge.observeChildTerminal(agentId, status, agentType, actuals),
+              )
             : Effect.void,
         ),
       );
@@ -1905,6 +2114,10 @@ export const makeCodexSessionRuntime = (
                 next.set(child.agentThreadId, childTurnId);
                 return next;
               });
+              yield* Ref.update(collabChildTurnUsageTrackerRef, (tracker) => {
+                tracker.begin(child.agentThreadId, childTurnId);
+                return tracker;
+              });
             }
             yield* emitEvent({
               kind: "notification",
@@ -1915,13 +2128,32 @@ export const makeCodexSessionRuntime = (
             });
             return true;
           }
-          case "turn/completed":
+          case "turn/completed": {
+            const childTurnId = notification.params.turn.id;
+            const completedActuals = yield* Ref.modify(
+              collabChildTurnUsageTrackerRef,
+              (tracker) =>
+                [
+                  tracker.complete({
+                    agentThreadId: child.agentThreadId,
+                    turnId: childTurnId,
+                    ...(metadata?.model ? { model: metadata.model } : {}),
+                    ...(metadata?.effort ? { reasoningEffort: metadata.effort } : {}),
+                  }),
+                  tracker,
+                ] as const,
+            );
             yield* Ref.update(collabChildLiveTurnsRef, (current) => {
               const next = new Map(current);
               next.delete(child.agentThreadId);
               return next;
             });
-            yield* observeCollabLifecycleTerminal(child.agentThreadId, "completed", child.role);
+            yield* observeCollabLifecycleTerminal(
+              child.agentThreadId,
+              "completed",
+              child.role,
+              completedActuals,
+            );
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1931,6 +2163,18 @@ export const makeCodexSessionRuntime = (
                 ...childIdentity,
                 turn: notification.params.turn,
               },
+            });
+            return true;
+          }
+          case "rawResponse/completed":
+            yield* Ref.update(collabChildTurnUsageTrackerRef, (tracker) => {
+              tracker.observeRawResponseCompleted({
+                agentThreadId: child.agentThreadId,
+                turnId: notification.params.turnId,
+                responseId: notification.params.responseId,
+                usage: notification.params.usage,
+              });
+              return tracker;
             });
             return true;
           case "thread/status/changed":
@@ -1980,6 +2224,10 @@ export const makeCodexSessionRuntime = (
               return next;
             });
             yield* markCollabChildClosed(child.agentThreadId);
+            yield* Ref.update(collabChildTurnUsageTrackerRef, (tracker) => {
+              tracker.abandon(child.agentThreadId);
+              return tracker;
+            });
             yield* observeCollabLifecycleTerminal(child.agentThreadId, "cancelled", child.role);
             yield* emitEvent({
               kind: "notification",
@@ -2006,6 +2254,10 @@ export const makeCodexSessionRuntime = (
               const next = new Map(current);
               next.delete(child.agentThreadId);
               return next;
+            });
+            yield* Ref.update(collabChildTurnUsageTrackerRef, (tracker) => {
+              tracker.abandon(child.agentThreadId);
+              return tracker;
             });
             yield* observeCollabLifecycleTerminal(child.agentThreadId, "failed", child.role);
             yield* emitEvent({

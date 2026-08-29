@@ -2,6 +2,20 @@ const BRIDGE_VERSION = "t3-codex-collab-lifecycle-bridge-v1";
 
 export const CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV = "T3CODE_CODEX_COLLAB_LIFECYCLE_HOOK_ARGV";
 
+export interface CodexChildTurnActuals {
+  readonly schema: "codex-child-turn-actuals-v1";
+  readonly child_thread_id: string;
+  readonly turn_id: string;
+  readonly model?: string;
+  readonly reasoning_effort?: string;
+  readonly token_usage?: {
+    readonly input_tokens: number;
+    readonly output_tokens: number;
+    readonly total_tokens: number;
+  };
+  readonly token_usage_provenance?: "raw-response-completed-sum-v1";
+}
+
 export interface CodexCollabLifecycleToolCall {
   readonly id: string;
   readonly tool: "spawnAgent" | "followupTask";
@@ -46,6 +60,7 @@ export type CodexCollabLifecycleHookPayload =
       readonly tool_use_id: string;
       readonly status: "completed" | "cancelled" | "failed";
       readonly tested_codex_version?: string;
+      readonly actuals?: CodexChildTurnActuals;
       readonly consumer_surface: "t3-native-collaboration";
       readonly bridge_version: typeof BRIDGE_VERSION;
     }
@@ -97,7 +112,13 @@ interface Attempt {
   startSeen: boolean;
   terminalSeen: boolean;
   terminalStatus: "completed" | "cancelled" | "failed" | undefined;
+  terminalActuals: CodexChildTurnActuals | undefined;
   failureSeen: boolean;
+}
+
+interface BufferedTerminal {
+  readonly status: "completed" | "cancelled" | "failed";
+  readonly actuals?: CodexChildTurnActuals;
 }
 
 /**
@@ -110,7 +131,7 @@ export class CodexCollabLifecycleBridge {
   readonly #testedCodexVersion: string | undefined;
   readonly #attemptsByToolUseId = new Map<string, Attempt>();
   readonly #attemptsByAgentId = new Map<string, Attempt>();
-  readonly #terminalAgentStatuses = new Map<string, "completed" | "cancelled" | "failed">();
+  readonly #terminalAgentStatuses = new Map<string, BufferedTerminal>();
   readonly #agentTypes = new Map<string, string>();
   #sessionEndSeen = false;
 
@@ -142,6 +163,7 @@ export class CodexCollabLifecycleBridge {
       startSeen: false,
       terminalSeen: false,
       terminalStatus: undefined,
+      terminalActuals: undefined,
       failureSeen: false,
     };
     this.#attemptsByToolUseId.set(call.id, attempt);
@@ -185,6 +207,7 @@ export class CodexCollabLifecycleBridge {
       startSeen: false,
       terminalSeen: false,
       terminalStatus: undefined,
+      terminalActuals: undefined,
       failureSeen: false,
     };
     this.#attemptsByToolUseId.set(input.id, attempt);
@@ -215,6 +238,7 @@ export class CodexCollabLifecycleBridge {
       startSeen: false,
       terminalSeen: false,
       terminalStatus: undefined,
+      terminalActuals: undefined,
       failureSeen: false,
     };
     this.#attemptsByToolUseId.set(input.id, attempt);
@@ -227,10 +251,14 @@ export class CodexCollabLifecycleBridge {
     agentId: string,
     status: "completed" | "cancelled" | "failed",
     agentType?: string | undefined,
+    actuals?: CodexChildTurnActuals | undefined,
   ): ReadonlyArray<CodexCollabLifecycleHookPayload> {
     const attempt = this.#attemptsByAgentId.get(agentId);
     if (!attempt || (attempt.terminalSeen && this.#hasUnboundAttempt())) {
-      this.#terminalAgentStatuses.set(agentId, status);
+      this.#terminalAgentStatuses.set(agentId, {
+        status,
+        ...(actuals ? { actuals: freezeChildTurnActuals(actuals) } : {}),
+      });
       return [];
     }
     if (attempt.terminalSeen) {
@@ -239,6 +267,7 @@ export class CodexCollabLifecycleBridge {
     attempt.agentType = nonEmptyString(agentType) ?? attempt.agentType ?? "unknown";
     attempt.terminalSeen = true;
     attempt.terminalStatus = status;
+    attempt.terminalActuals = actuals ? freezeChildTurnActuals(actuals) : undefined;
     return this.#startAndMaybeStop(attempt, agentId);
   }
 
@@ -294,10 +323,11 @@ export class CodexCollabLifecycleBridge {
     const previousAttempt = this.#attemptsByAgentId.get(agentId);
     attempt.agentType =
       this.#agentTypes.get(agentId) ?? previousAttempt?.agentType ?? attempt.agentType;
-    const bufferedTerminalStatus = this.#terminalAgentStatuses.get(agentId);
-    if (bufferedTerminalStatus) {
+    const bufferedTerminal = this.#terminalAgentStatuses.get(agentId);
+    if (bufferedTerminal) {
       attempt.terminalSeen = true;
-      attempt.terminalStatus = bufferedTerminalStatus;
+      attempt.terminalStatus = bufferedTerminal.status;
+      attempt.terminalActuals = bufferedTerminal.actuals;
       this.#terminalAgentStatuses.delete(agentId);
     }
     this.#attemptsByAgentId.set(agentId, attempt);
@@ -366,6 +396,7 @@ export class CodexCollabLifecycleBridge {
       tool_use_id: attempt.toolUseId,
       status: attempt.terminalStatus ?? "cancelled",
       ...(this.#testedCodexVersion ? { tested_codex_version: this.#testedCodexVersion } : {}),
+      ...(attempt.terminalActuals ? { actuals: attempt.terminalActuals } : {}),
       consumer_surface: "t3-native-collaboration",
       bridge_version: BRIDGE_VERSION,
     };
@@ -427,4 +458,19 @@ export function parseCodexCollabLifecycleHookArgv(
 
 function nonEmptyString(value: string | null | undefined): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function freezeChildTurnActuals(actuals: CodexChildTurnActuals): CodexChildTurnActuals {
+  const tokenUsage = actuals.token_usage ? Object.freeze({ ...actuals.token_usage }) : undefined;
+  return Object.freeze({
+    schema: actuals.schema,
+    child_thread_id: actuals.child_thread_id,
+    turn_id: actuals.turn_id,
+    ...(actuals.model ? { model: actuals.model } : {}),
+    ...(actuals.reasoning_effort ? { reasoning_effort: actuals.reasoning_effort } : {}),
+    ...(tokenUsage ? { token_usage: tokenUsage } : {}),
+    ...(actuals.token_usage_provenance
+      ? { token_usage_provenance: actuals.token_usage_provenance }
+      : {}),
+  });
 }
