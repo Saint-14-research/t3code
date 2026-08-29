@@ -31,10 +31,14 @@ import * as Crypto from "effect/Crypto";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
@@ -58,6 +62,7 @@ import {
   CodexResumeCursorSchema,
   CodexSessionRuntimeThreadIdMissingError,
   describeMcpElicitation,
+  isCodexActiveWriterError,
   makeCodexSessionRuntime,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
@@ -123,6 +128,26 @@ function mapCodexRuntimeError(
     detail: error.message,
     cause: error,
   });
+}
+
+export function mapCodexStartError(
+  threadId: ThreadId,
+  cause: CodexSessionRuntimeError,
+): ProviderAdapterError {
+  return isCodexActiveWriterError(cause)
+    ? new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "thread/resume",
+        detail:
+          "This Codex task is still open in another Codex process. T3 Code did not start a second writer. Close that task in the other client, then send again, or start a new task.",
+        cause,
+      })
+    : new ProviderAdapterProcessError({
+        provider: PROVIDER,
+        threadId,
+        detail: cause.message,
+        cause,
+      });
 }
 
 type CodexLifecycleItem =
@@ -1662,8 +1687,28 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const threadLocksRef = yield* SynchronizedRef.make(new Map<ThreadId, Semaphore.Semaphore>());
 
-  const startSession: CodexAdapterShape["startSession"] = (input) =>
+  const getThreadSemaphore = (threadId: ThreadId) =>
+    SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
+      const existing = Option.fromNullishOr(current.get(threadId));
+      return Option.match(existing, {
+        onNone: () =>
+          Semaphore.make(1).pipe(
+            Effect.map((semaphore) => {
+              const next = new Map(current);
+              next.set(threadId, semaphore);
+              return [semaphore, next] as const;
+            }),
+          ),
+        onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+      });
+    });
+
+  const withThreadLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+    Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
+
+  const startSessionUnlocked: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
       Effect.gen(function* () {
         if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -1758,15 +1803,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         ).pipe(Effect.forkIn(sessionScope));
 
         const started = yield* runtime.start().pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterProcessError({
-                provider: PROVIDER,
-                threadId: input.threadId,
-                detail: cause.message,
-                cause,
-              }),
-          ),
+          Effect.mapError((cause) => mapCodexStartError(input.threadId, cause)),
           Effect.onError(() =>
             runtime.close.pipe(
               Effect.andThen(Effect.ignore(Scope.close(sessionScope, Exit.void))),
@@ -1788,6 +1825,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         return started;
       }),
     );
+
+  const startSession: CodexAdapterShape["startSession"] = (input) =>
+    withThreadLock(input.threadId, startSessionUnlocked(input));
 
   const resolveAttachment = Effect.fn("resolveAttachment")(function* (
     input: ProviderSendTurnInput,
@@ -1966,21 +2006,34 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     if (session.stopped) {
       return;
     }
+    yield* session.runtime.close.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: session.threadId,
+            detail: cause.message,
+            cause,
+          }),
+      ),
+    );
     session.stopped = true;
     sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
-    Effect.gen(function* () {
-      const session = sessions.get(threadId);
-      if (!session) {
-        return;
-      }
-      yield* stopSessionInternal(session);
-    });
+    withThreadLock(
+      threadId,
+      Effect.gen(function* () {
+        const session = sessions.get(threadId);
+        if (!session) {
+          return;
+        }
+        yield* stopSessionInternal(session);
+      }),
+    );
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
@@ -1993,10 +2046,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
   const stopAll: CodexAdapterShape["stopAll"] = () =>
-    Effect.forEach(Array.from(sessions.values()), stopSessionInternal, {
-      concurrency: 1,
-      discard: true,
-    }).pipe(Effect.asVoid);
+    Effect.gen(function* () {
+      const results = yield* Effect.forEach(
+        Array.from(sessions.keys()),
+        (threadId) => stopSession(threadId).pipe(Effect.result),
+        { concurrency: 4 },
+      );
+      const firstFailure = results.find(Result.isFailure);
+      if (firstFailure !== undefined) {
+        return yield* firstFailure.failure;
+      }
+    });
 
   yield* Effect.acquireRelease(Effect.void, () =>
     stopAll().pipe(

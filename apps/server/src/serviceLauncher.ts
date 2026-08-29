@@ -31,7 +31,7 @@ import { isEntrypoint } from "./entrypoint.ts";
 
 const HANDOFF_DELAY_MS = 2_000;
 const PREPARED_TIMEOUT_MS = 120_000;
-const TERMINATE_GRACE_MS = 5_000;
+const TERMINATE_GRACE_MS = 10_000;
 
 type TerminalStatus = "committed" | "rolled-back" | "failed";
 type ChildRole = "active" | "trial";
