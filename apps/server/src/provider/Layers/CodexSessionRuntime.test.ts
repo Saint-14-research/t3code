@@ -14,6 +14,7 @@ import {
   codexDefaultModeDeveloperInstructions,
   codexPlanModeDeveloperInstructions,
 } from "../CodexDeveloperInstructions.ts";
+import { parseCodexAppServerVersion } from "./CodexProvider.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
   CODEX_COLLAB_LIFECYCLE_HOOK_ARGV_ENV,
@@ -35,7 +36,7 @@ const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequest
 
 describe("CodexCollabLifecycleBridge", () => {
   it("records the captured native spawn boundary with explicit path-only provenance", () => {
-    const bridge = new CodexCollabLifecycleBridge("parent-thread");
+    const bridge = new CodexCollabLifecycleBridge("parent-thread", "0.151.0");
     const payloads = [
       ...bridge.observeNativeDispatch({
         id: "call-native-spawn",
@@ -47,12 +48,13 @@ describe("CodexCollabLifecycleBridge", () => {
         agentId: "child-native",
         agentPath: "/root/native_lifecycle_canary",
       }),
-      ...bridge.observeChildRole("child-native", "mechanical"),
+      ...bridge.observeChildRole("child-native", undefined),
+      ...bridge.observeChildTerminal("child-native", "completed"),
     ];
 
     NodeAssert.deepStrictEqual(
       payloads.map((payload) => payload.hook_event_name),
-      ["PreToolUse", "SubagentStart"],
+      ["PreToolUse", "SubagentStart", "SubagentStop"],
     );
     NodeAssert.deepStrictEqual(
       payloads[0]?.hook_event_name === "PreToolUse" ? payloads[0].tool_input : undefined,
@@ -70,6 +72,22 @@ describe("CodexCollabLifecycleBridge", () => {
       payloads[1]?.hook_event_name === "SubagentStart" ? payloads[1].agent_type : undefined,
       "mechanical",
     );
+    NodeAssert.equal(
+      payloads[2]?.hook_event_name === "SubagentStop" ? payloads[2].agent_type : undefined,
+      "mechanical",
+    );
+    NodeAssert.equal(
+      payloads[1]?.hook_event_name === "SubagentStart"
+        ? payloads[1].tested_codex_version
+        : undefined,
+      "0.151.0",
+    );
+    NodeAssert.equal(
+      payloads[2]?.hook_event_name === "SubagentStop"
+        ? payloads[2].tested_codex_version
+        : undefined,
+      "0.151.0",
+    );
     NodeAssert.deepStrictEqual(
       bridge.observeNativeSpawn({
         id: "call-native-spawn",
@@ -78,6 +96,11 @@ describe("CodexCollabLifecycleBridge", () => {
       }),
       [],
     );
+  });
+
+  it("accepts only a normalized semantic version from the app-server user agent", () => {
+    NodeAssert.equal(parseCodexAppServerVersion("codex-cli/0.151.0 (Mac OS 26.0)"), "0.151.0");
+    NodeAssert.equal(parseCodexAppServerVersion("codex-cli/not-a-version"), undefined);
   });
 
   it("emits the native hook lifecycle once for one causally bound child", () => {

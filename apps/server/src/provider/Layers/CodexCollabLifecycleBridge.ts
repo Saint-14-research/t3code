@@ -34,6 +34,7 @@ export type CodexCollabLifecycleHookPayload =
       readonly agent_id: string;
       readonly agent_type: string;
       readonly tool_use_id: string;
+      readonly tested_codex_version?: string;
       readonly consumer_surface: "t3-native-collaboration";
       readonly bridge_version: typeof BRIDGE_VERSION;
     }
@@ -44,6 +45,7 @@ export type CodexCollabLifecycleHookPayload =
       readonly agent_type: string;
       readonly tool_use_id: string;
       readonly status: "completed" | "cancelled" | "failed";
+      readonly tested_codex_version?: string;
       readonly consumer_surface: "t3-native-collaboration";
       readonly bridge_version: typeof BRIDGE_VERSION;
     }
@@ -105,14 +107,16 @@ interface Attempt {
  */
 export class CodexCollabLifecycleBridge {
   readonly sessionId: string;
+  readonly #testedCodexVersion: string | undefined;
   readonly #attemptsByToolUseId = new Map<string, Attempt>();
   readonly #attemptsByAgentId = new Map<string, Attempt>();
   readonly #terminalAgentStatuses = new Map<string, "completed" | "cancelled" | "failed">();
   readonly #agentTypes = new Map<string, string>();
   #sessionEndSeen = false;
 
-  constructor(sessionId: string) {
+  constructor(sessionId: string, testedCodexVersion?: string | undefined) {
     this.sessionId = sessionId;
+    this.#testedCodexVersion = testedCodexVersion;
   }
 
   observeToolCall(
@@ -288,7 +292,8 @@ export class CodexCollabLifecycleBridge {
     }
     attempt.agentId = agentId;
     const previousAttempt = this.#attemptsByAgentId.get(agentId);
-    attempt.agentType = this.#agentTypes.get(agentId) ?? previousAttempt?.agentType;
+    attempt.agentType =
+      this.#agentTypes.get(agentId) ?? previousAttempt?.agentType ?? attempt.agentType;
     const bufferedTerminalStatus = this.#terminalAgentStatuses.get(agentId);
     if (bufferedTerminalStatus) {
       attempt.terminalSeen = true;
@@ -360,6 +365,7 @@ export class CodexCollabLifecycleBridge {
       agent_type: attempt.agentType ?? "unknown",
       tool_use_id: attempt.toolUseId,
       status: attempt.terminalStatus ?? "cancelled",
+      ...(this.#testedCodexVersion ? { tested_codex_version: this.#testedCodexVersion } : {}),
       consumer_surface: "t3-native-collaboration",
       bridge_version: BRIDGE_VERSION,
     };
@@ -376,6 +382,7 @@ export class CodexCollabLifecycleBridge {
       agent_id: agentId,
       agent_type: attempt.agentType ?? "unknown",
       tool_use_id: attempt.toolUseId,
+      ...(this.#testedCodexVersion ? { tested_codex_version: this.#testedCodexVersion } : {}),
       consumer_surface: "t3-native-collaboration",
       bridge_version: BRIDGE_VERSION,
     };
